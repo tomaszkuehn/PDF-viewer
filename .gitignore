@@ -1,0 +1,51 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java / Kotlin build artifacts
+*.class
+*.log
+.kotlin/
+
+# Generated files
+bin/
+gen/
+out/
+release/
+
+# Gradle files
+.gradle/
+build/
+
+# Local configuration file (sdk dir, etc.)
+local.properties
+
+# Log / IDE
+*.log
+.idea/
+*.iml
+*.ipr
+*.iws
+captures/
+
+# Keystore files
+*.jks
+*.keystore
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IJFW project memory (not part of the app)
+.ijfw/
+ijfw/
+
+# Android Studio
+.navigation/
+*.jks

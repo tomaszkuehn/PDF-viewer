@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pdf Viewer</string>
+    <string name="open_pdf">Otwórz PDF</string>
+    <string name="search">Szukaj</string>
+    <string name="bookmark">Zakładka</string>
+    <string name="bookmarks">Zakładki</string>
+    <string name="search_hint">Szukaj w dokumencie…</string>
+    <string name="no_results">Brak wyników</string>
+    <string name="search_unavailable">Wyszukiwanie dostępne na Androidzie 15 (API 35) i nowszych</string>
+    <string name="bookmark_added">Dodano zakładkę</string>
+    <string name="bookmark_removed">Usunięto zakładkę</string>
+    <string name="no_bookmarks">Brak zapisanych zakładek</string>
+    <string name="page_format">%1$d / %2$d</string>
+    <string name="open_failed">Nie można otworzyć pliku PDF</string>
+    <string name="jump_title">Przejdź do strony</string>
+    <string name="jump_ok">Przejdź</string>
+    <string name="cancel">Anuluj</string>
+    <string name="go_to_page">Idź do strony…</string>
+</resources>
