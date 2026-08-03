@@ -70,6 +70,9 @@ class PageFragment : Fragment() {
 
     override fun onDestroyView() {
         (requireActivity() as PdfViewerActivity).unregisterPageFragment(pageIndex)
+        val drawable = binding.pageImage.drawable
+        (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap?.recycle()
+        binding.pageImage.setImageDrawable(null)
         super.onDestroyView()
         _binding = null
     }

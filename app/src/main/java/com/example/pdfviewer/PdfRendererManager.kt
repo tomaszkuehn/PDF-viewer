@@ -39,8 +39,9 @@ class PdfRendererManager(
         val page = renderer.openPage(index)
         val pageWidthPoints = page.width
         val pageHeightPoints = page.height
-        val scale = targetWidthPx.toFloat() / pageWidthPoints
-        val w = targetWidthPx
+        val scale = (targetWidthPx.toFloat() / pageWidthPoints)
+            .coerceAtMost(MAX_DIMENSION_PX.toFloat() / maxOf(pageWidthPoints, pageHeightPoints))
+        val w = (pageWidthPoints * scale).roundToInt()
         val h = (pageHeightPoints * scale).roundToInt()
         val bitmap = createBitmap(w, h, Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(Color.WHITE)
@@ -77,6 +78,11 @@ class PdfRendererManager(
             fileDescriptor.close()
         } catch (_: Exception) {
         }
+    }
+
+    companion object {
+        /** Caps either bitmap dimension so a single rendered page stays memory-bounded. */
+        private const val MAX_DIMENSION_PX = 2600
     }
 }
 
