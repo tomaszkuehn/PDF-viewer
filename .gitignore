@@ -57,3 +57,5 @@ ijfw/
 .opencode/memory/plugin-errors.log
 .opencode/memory/project-facts.auto.md
 .opencode/node_modules/
+.opencode/memory/tui-trace.log
+node_modules/

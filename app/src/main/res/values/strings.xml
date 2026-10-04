@@ -17,4 +17,6 @@
     <string name="jump_ok">Przejdź</string>
     <string name="cancel">Anuluj</string>
     <string name="go_to_page">Idź do strony…</string>
+    <string name="scan_document">Skanuj dokument</string>
+    <string name="scan_unavailable">Skanowanie niedostępne — wymaga Google Play Services</string>
 </resources>

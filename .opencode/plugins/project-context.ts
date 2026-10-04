@@ -2,12 +2,28 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSy
 import { join, relative, resolve, basename } from "node:path"
 import { createHash } from "node:crypto"
 import { execSync } from "node:child_process"
+import { tmpdir } from "node:os"
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+type AIProvider = "openai-compatible" | "ollama" | "anthropic"
+
+type AIConfig = {
+  enabled: boolean
+  provider: AIProvider
+  baseUrl: string                 // overrides per-provider default
+  apiKey: string                   // env interpolation ${VAR}
+  model: string                     // tani model np. gpt-4o-mini
+  maxTokens: number
+  temperature: number
+  timeoutMs: number
+  fallbackChain: string[]          // kolejne modele do spróbowania
+  minIntervalMs: number             // min. odstęp między automatycznymi wywołaniami AI (session.idle/compacted); 0 = brak throttle. Komendy na żądanie (/codemem ai triage) ignorują.
+}
 
 type Config = {
   enabled: boolean
@@ -35,6 +51,8 @@ type Config = {
   maxContextTokens: number        // 0 = autodetect from Model.limit.context (fallback 200000)
   compactThreshold: number        // percent (0-100) of limit; default 80
   compactReservedTokens: number   // buffer left for compaction (mirrors compaction.reserved)
+  // AI (Opcja A — własny tani model, niezależny od modelu kodującego)
+  ai: AIConfig
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -62,6 +80,19 @@ const DEFAULT_CONFIG: Config = {
   maxContextTokens: 0,
   compactThreshold: 80,
   compactReservedTokens: 10000,
+  // AI — domyślnie wyłączone. Włącz w opencode.json plugin options.
+  ai: {
+    enabled: false,
+    provider: "openai-compatible",
+    baseUrl: "",
+    apiKey: "",
+    model: "gpt-4o-mini",
+    maxTokens: 800,
+    temperature: 0,
+    timeoutMs: 30000,
+    fallbackChain: [],
+    minIntervalMs: 600000,
+  },
 }
 
 type SeenContext = {
@@ -113,6 +144,7 @@ type Metrics = {
   diskBytes: number
   diskLimitBytes: number
   artifactsBytes: number
+  artifactsList: { id: string; bytes: number }[]  // dla TUI (unika readdirSync+statSync co 3s)
   cacheBytes: number
   handoffAgeMin: number
   modifiedCount: number
@@ -127,6 +159,25 @@ type Metrics = {
   revertsCount: number
   factsTokens: number
   factsMaxTokens: number
+  // --- AI (Opcja A) live stats ---
+  aiEnabled: boolean
+  aiProvider: string
+  aiModel: string
+  aiCalls: number
+  aiSuccesses: number
+  aiFailures: number
+  aiLastCallMs: number
+  aiLastError: string
+  aiHealthState: "active" | "offline" | "unknown"
+  aiBusy: boolean
+  aiBusyLabel: string
+  aiBusySince: number
+  // --- Dynamiczny timeout ---
+  aiConfigTimeoutMs: number
+  aiMaxObservedMs: number
+  aiLastDurationMs: number
+  aiTimeoutWarn: boolean
+  aiTimeoutExtended: boolean
 }
 
 type TestRun = {
@@ -186,7 +237,11 @@ let cfg: Config = { ...DEFAULT_CONFIG }
 let memoryDir = ""
 let worktreePath = ""
 let projectRoot = ""
-let seen: SeenContext[] = []
+let seen: Map<string, SeenContext> = new Map()
+
+function dedupKey(s: Pick<SeenContext, "filePath" | "contentHash" | "lineStart" | "lineEnd">): string {
+  return `${s.filePath}::${s.contentHash}::${s.lineStart ?? 0}-${s.lineEnd ?? "end"}`
+}
 let metrics: Metrics = {
   sessionId: "",
   toolCalls: 0,
@@ -208,6 +263,7 @@ let metrics: Metrics = {
   diskBytes: 0,
   diskLimitBytes: MAX_ARTIFACT_DIR_MB * 1024 * 1024,
   artifactsBytes: 0,
+  artifactsList: [],
   cacheBytes: 0,
   handoffAgeMin: 0,
   modifiedCount: 0,
@@ -222,8 +278,26 @@ let metrics: Metrics = {
   revertsCount: 0,
   factsTokens: 0,
   factsMaxTokens: 1500,
+  aiEnabled: false,
+  aiProvider: "",
+  aiModel: "",
+  aiCalls: 0,
+  aiSuccesses: 0,
+  aiFailures: 0,
+  aiLastCallMs: 0,
+  aiLastError: "",
+  aiHealthState: "unknown",
+  aiBusy: false,
+  aiBusyLabel: "",
+  aiBusySince: 0,
+  aiConfigTimeoutMs: 0,
+  aiMaxObservedMs: 0,
+  aiLastDurationMs: 0,
+  aiTimeoutWarn: false,
+  aiTimeoutExtended: false,
 }
 let lastInjectedContext = ""
+let pendingSystemContext: string = ""                 // blok PROJECT MEMORY do wstrzykiwania w system prompt (experimental.chat.system.transform)
 let lastSessionId = ""
 
 // --- Additions: persistent dedup cache, test history, session trace ----------
@@ -242,6 +316,8 @@ let modelContextLimit: number = 0          // 0 = nie ustalono; autodetekcja z M
 let compactSuggestionShown: boolean = false // czy już pokazano sugestię dla obecnego przekroczenia
 let lastAssistantModel: string = ""        // "provider/model" do autodetekcji limitu
 let currentSessionId: string = ""           // bieżąca sesja (do client.session.messages)
+let pluginClient: any = null                 // ref client API z closure pluginu (do compact-now, ai triage)
+let lastUserCommandTs: number = 0          // timestamp ostatniej komendy /codemem — pomija throttle auto-AI w idle
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -253,6 +329,7 @@ function failOpen(fn: () => void, label: string) {
   } catch (e: any) {
     try {
       const logPath = join(memoryDir || process.cwd(), "plugin-errors.log")
+      rotateLogIfNeeded(logPath)
       writeFileSync(logPath, `[${new Date().toISOString()}] ${label}: ${e?.message ?? e}\n`, { flag: "a" })
     } catch {
       // swallow
@@ -266,6 +343,7 @@ function failOpenReturn<T>(fn: () => T, fallback: T, label: string): T {
   } catch (e: any) {
     try {
       const logPath = join(memoryDir || process.cwd(), "plugin-errors.log")
+      rotateLogIfNeeded(logPath)
       writeFileSync(logPath, `[${new Date().toISOString()}] ${label}: ${e?.message ?? e}\n`, { flag: "a" })
     } catch {
       // swallow
@@ -274,12 +352,25 @@ function failOpenReturn<T>(fn: () => T, fallback: T, label: string): T {
   }
 }
 
+const FAIL_OPEN_ASYNC_TIMEOUT_MS = 35000
+
 async function failOpenAsync(fn: () => Promise<void> | void, label: string) {
   try {
-    await fn()
+    const task = fn()
+    if (task && typeof (task as Promise<void>).then === "function") {
+      // Ochrona przed zawieszonymi promisami (np. fetch bez odpowiedzi, session.prompt
+      // wiszący na SDK). Bez tego opencode czeka w nieskończoność i ESC nie przerywa.
+      await Promise.race([
+        task as Promise<void>,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error(`timeout ${FAIL_OPEN_ASYNC_TIMEOUT_MS}ms`)), FAIL_OPEN_ASYNC_TIMEOUT_MS)
+        ),
+      ])
+    }
   } catch (e: any) {
     try {
       const logPath = join(memoryDir || process.cwd(), "plugin-errors.log")
+      rotateLogIfNeeded(logPath)
       writeFileSync(logPath, `[${new Date().toISOString()}] ${label}: ${e?.message ?? e}\n`, { flag: "a" })
     } catch {
       // swallow
@@ -363,6 +454,647 @@ function isSensitivePath(filePath: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// AI module (Opcja A — własny tani model, niezależny od modelu kodującego)
+// ---------------------------------------------------------------------------
+// aiComplete() woła HTTP endpoint taniego modelu konfigurowanego w plugin options.
+// NIGDY nie rzuca — zwraca null przy błędzie; wywołujący ma fallback deterministyczny.
+// Fallbacki (warstwowo): brak konfiga → null; network/HTTP error → retry+chain → null;
+// zła odpowiedź → retry temp:0 → null.
+
+type AIStatus = {
+  enabled: boolean
+  provider: string
+  model: string
+  lastCallMs: number
+  lastError: string
+  calls: number
+  successes: number
+  failures: number
+  healthState: "active" | "offline" | "unknown"
+  busy: boolean
+  busyLabel: string
+  busySince: number
+  // --- Dynamiczny timeout ---
+  configTimeoutMs: number           // pierwotny timeout z configa (do porównań w TUI)
+  maxObservedMs: number            // najdłuższy zarejestrowany czas promptu (persistent)
+  lastDurationMs: number           // czas ostatniego promptu
+  timeoutWarn: boolean             // true gdy ostatni prompt ≥80% limitu (zbliża się)
+  timeoutExtended: boolean         // true gdy ostatni prompt przekroczył pierwotny limit (ale zmieścił się w 1.5×)
+}
+
+let aiStatus: AIStatus = {
+  enabled: false,
+  provider: "",
+  model: "",
+  lastCallMs: 0,
+  lastError: "",
+  calls: 0,
+  successes: 0,
+  failures: 0,
+  healthState: "unknown",
+  busy: false,
+  busyLabel: "",
+  busySince: 0,
+  configTimeoutMs: 0,
+  maxObservedMs: 0,
+  lastDurationMs: 0,
+  timeoutWarn: false,
+  timeoutExtended: false,
+}
+
+// Circuit breaker: po N kolejnych awariach w oknie czasowym AI jest wyłączane,
+// żeby nie tworzyć pętli błędów (np. endpoint 500 w nieskończoność).
+const AI_CB_THRESHOLD = 5          // po tylu kolejnych awariach wyłączamy
+const AI_CB_WINDOW_MS = 60_000      // okno liczenia awarii (1 min)
+let aiCbFailuresSince: number = 0    // licznik kolejnych awarii
+let aiCbFirstFailureAt: number = 0   // timestamp pierwszej awarii w oknie
+let aiCbTrippedUntil: number = 0     // do kiedy breaker jest otwarty (0 = zamknięty)
+
+function aiCbShouldSkip(): boolean {
+  if (aiCbTrippedUntil && Date.now() < aiCbTrippedUntil) return true
+  if (aiCbTrippedUntil && Date.now() >= aiCbTrippedUntil) {
+    // reset po cooldownie — spróbuj ponownie
+    aiCbTrippedUntil = 0
+    aiCbFailuresSince = 0
+  }
+  return false
+}
+
+function aiCbRecordFailure() {
+  const now = Date.now()
+  if (!aiCbFirstFailureAt || (now - aiCbFirstFailureAt) > AI_CB_WINDOW_MS) {
+    aiCbFirstFailureAt = now
+    aiCbFailuresSince = 1
+  } else {
+    aiCbFailuresSince += 1
+  }
+  if (aiCbFailuresSince >= AI_CB_THRESHOLD) {
+    aiCbTrippedUntil = now + AI_CB_WINDOW_MS
+    aiLogError(`AI circuit breaker TRIPPED: ${aiCbFailuresSince} failures in window, pausing AI for ${AI_CB_WINDOW_MS}ms`)
+  }
+}
+
+function aiCbRecordSuccess() {
+  aiCbFailuresSince = 0
+  aiCbFirstFailureAt = 0
+  aiCbTrippedUntil = 0
+}
+
+// --- AI auto-run throttle -----------------------------------------------------
+// #3: ogranicza częstotliwość AUTOMATYCZNYCH wywołań AI (aiSummarizeSession
+// na session.idle/compacted). Komendy na żądanie (/codemem ai triage),
+// health check na session.created oraz aiExtractHumanFacts NIE są throttlowane.
+// aiExtractHumanFacts używa własnego change-detection (hash plików źródłowych).
+// Stan trzyma timestamp ostatniego auto-wywołania w pliku cache.
+function aiThrottlePath(): string {
+  return join(memoryDir, "cache", "ai-throttle.json")
+}
+
+function aiAutoThrottleMs(): number {
+  const c = cfg?.ai
+  if (!c || typeof c.minIntervalMs !== "number" || c.minIntervalMs < 0) return 600000
+  return c.minIntervalMs
+}
+
+// Zwraca true jeśli auto-wywołanie AI powinno być pominięte (zbyt wkrótce od ostatniego).
+// Pomija throttle gdy idle/compacted nastąpiło w wyniku komendy użytkownika (okno 30 s).
+function aiAutoThrottled(): boolean {
+  const minInterval = aiAutoThrottleMs()
+  if (minInterval <= 0) return false        // 0 = throttle wyłączony
+  if (lastUserCommandTs > 0 && (Date.now() - lastUserCommandTs) < 30000) return false
+  const data = readJson<{ lastAutoRunTs?: number } | null>(aiThrottlePath())
+  const last = data?.lastAutoRunTs ?? 0
+  return (Date.now() - last) < minInterval
+}
+
+// Zapisuje timestamp bieżącego auto-wywołania (wołać TYLKO przy rzeczywistym auto-wywołaniu).
+function aiAutoMarkRun() {
+  try { writeJson(aiThrottlePath(), { lastAutoRunTs: Date.now() }) } catch { /* swallow */ }
+}
+
+// --- Dynamiczny timeout: śledzenie najdłuższego czasu promptu -----------------
+// maxObservedMs jest persistentne (przeżywa restarty sesji), bo celem jest
+// adaptacja timeoutu do realnego zachowania lokalnego modelu w czasie.
+function aiMaxObservedPath(): string {
+  return join(memoryDir, "cache", "ai-max-observed.json")
+}
+
+function aiLoadMaxObserved(): number {
+  const data = readJson<{ maxObservedMs?: number } | null>(aiMaxObservedPath())
+  return (data && typeof data.maxObservedMs === "number") ? data.maxObservedMs : 0
+}
+
+function aiSaveMaxObserved(ms: number) {
+  try { writeJson(aiMaxObservedPath(), { maxObservedMs: ms }) } catch { /* swallow */ }
+}
+
+// Efektywny twardy timeout: pierwotny timeoutMs × 1.5 (dopuszczamy o 50% dłuższy czas).
+function aiEffectiveTimeoutMs(c: AIConfig): number {
+  const base = c.timeoutMs > 0 ? c.timeoutMs : 30000
+  return Math.round(base * 1.5)
+}
+
+// Próg ostrzeżenia "zbliża się do limitu" — 80% pierwotnego timeoutMs.
+function aiTimeoutWarnThresholdMs(c: AIConfig): number {
+  const base = c.timeoutMs > 0 ? c.timeoutMs : 30000
+  return Math.round(base * 0.8)
+}
+
+// --- Timeout override (z komendy /codemem ai auto-timeout) --------------------
+// Ustawia pierwotny timeoutMs na wartość większą o 30% od najdłuższego dotąd
+// zarejestrowanego promptu. Przeżywa restarty (zapisane w cache).
+function aiTimeoutOverridePath(): string {
+  return join(memoryDir, "cache", "ai-timeout-override.json")
+}
+
+function aiLoadTimeoutOverride(): number {
+  const data = readJson<{ timeoutMs?: number } | null>(aiTimeoutOverridePath())
+  return (data && typeof data.timeoutMs === "number" && data.timeoutMs > 0) ? data.timeoutMs : 0
+}
+
+function aiSaveTimeoutOverride(ms: number) {
+  try { writeJson(aiTimeoutOverridePath(), { timeoutMs: ms }) } catch { /* swallow */ }
+}
+
+function aiClearTimeoutOverride() {
+  try { rmSync(aiTimeoutOverridePath(), { force: true }) } catch { /* swallow */ }
+}
+
+// /codemem ai auto-timeout: ustaw timeoutMs = maxObservedMs * 1.3 (min. 30 s).
+// Zwraca komunikat potwierdzający. Gdy brak obserwacji, sugeruje retry później.
+function aiAutoTimeoutCommand(): string {
+  const observed = aiStatus.maxObservedMs || aiLoadMaxObserved()
+  if (observed <= 0) {
+    return [
+      "AI auto-timeout: brak zarejestrowanych czasów promptów.",
+      "Wywołaj komendę po co najmniej jednym udanym prompcie AI.",
+    ].join("\n")
+  }
+  const newTimeout = Math.max(30000, Math.round(observed * 1.3))
+  cfg.ai.timeoutMs = newTimeout
+  aiSaveTimeoutOverride(newTimeout)
+  aiStatus.configTimeoutMs = newTimeout
+  flushMetrics()
+  return [
+    `AI auto-timeout: ustawiono timeoutMs = ${newTimeout}ms`,
+    `  (najdłuższy prompt: ${observed}ms × 1.3 + zaokrąglenie)`,
+    `  Twardy limit (1.5×): ${Math.round(newTimeout * 1.5)}ms`,
+    `  Override zapisany w cache/ai-timeout-override.json.`,
+  ].join("\n")
+}
+
+const LOG_ROTATE_MAX_BYTES = 1_000_000   // 1 MB — przy tnij do ostatnich 200 linii
+
+function rotateLogIfNeeded(logPath: string) {
+  try {
+    const st = statSync(logPath)
+    if (st.size > LOG_ROTATE_MAX_BYTES) {
+      const raw = readFileSync(logPath, "utf8")
+      const lines = raw.split("\n")
+      const kept = lines.slice(-200).join("\n")
+      writeFileSync(logPath, kept, "utf8")
+    }
+  } catch { /* swallow */ }
+}
+
+function aiLogError(msg: string) {
+  aiStatus.lastError = msg
+  try {
+    const logPath = join(memoryDir || process.cwd(), "plugin-ai.log")
+    rotateLogIfNeeded(logPath)
+    writeFileSync(logPath, `[${new Date().toISOString()}] ${msg}\n`, { flag: "a" })
+  } catch { /* swallow */ }
+}
+
+// Parsuje "providerID/modelID" — dzieli tylko na pierwszym slashu, by obsłużyć
+// modelID zawierające slashe (np. "openrouter/cohere/north-mini-code:free").
+// Zwraca [providerID, modelID] lub ["", ""] gdy niepoprawny.
+function parseModelKey(modelKey: string): [string, string] {
+  if (!modelKey || typeof modelKey !== "string") return ["", ""]
+  const slashIdx = modelKey.indexOf("/")
+  if (slashIdx <= 0 || slashIdx >= modelKey.length - 1) return ["", ""]
+  return [modelKey.slice(0, slashIdx), modelKey.slice(slashIdx + 1)]
+}
+
+// Bezpieczna serializacja błędu/obiektu do stringa (nigdy nie zwraca "[object Object]").
+function safeErrorString(e: any): string {
+  if (e == null) return "null"
+  if (typeof e === "string") return e
+  if (e?.message && typeof e.message === "string") return e.message
+  if (e?.error && typeof e.error === "string") return e.error
+  try { return JSON.stringify(e) } catch { return String(e) }
+}
+
+// Interpolacja ${ENV_VAR} w wartościach konfiga (np. apiKey: "${OPENAI_API_KEY}").
+// Obsługuje też literał bez zmiennej środowiskowej: ${literal} lub ${ns:literal}
+// — zwraca wtedy wartość dosłowną (bez ${ i }), by móc wpisać apiKey inline.
+function interpolateEnv(value: string): string {
+  if (!value || typeof value !== "string") return value
+  return value.replace(/\$\{([^}]+)\}/g, (_, inner: string) => {
+    const name = inner.trim()
+    // Jeśli nazwa jest poprawnym identyfikatorem zmiennej środowiskowej, zinterpoluj.
+    if (/^[A-Z_][A-Z0-9_]*$/.test(name)) {
+      return process.env[name] ?? ""
+    }
+    // Inaczej: zwróć wartość dosłowną (obsługa ${sk-lm-xxx:yyy} itp.).
+    return name
+  })
+}
+
+function aiEffectiveConfig(): AIConfig | null {
+  const c = cfg.ai
+  if (!c || !c.enabled) return null
+  const apiKey = interpolateEnv(c.apiKey).trim()
+  // ollama lokalnie nie wymaga apiKey
+  if (c.provider !== "ollama" && !apiKey) return null
+  return {
+    ...c,
+    apiKey,
+    baseUrl: c.baseUrl || aiDefaultBaseUrl(c.provider),
+  }
+}
+
+function aiDefaultBaseUrl(provider: AIProvider): string {
+  switch (provider) {
+    case "ollama": return "http://localhost:11434"
+    case "anthropic": return "https://api.anthropic.com/v1"
+    case "openai-compatible":
+    default: return "https://api.openai.com/v1"
+  }
+}
+
+// Buduje body zapytania per provider
+function aiBuildBody(c: AIConfig, system: string, prompt: string, jsonMode: boolean): any {
+  if (c.provider === "anthropic") {
+    return {
+      model: c.model,
+      max_tokens: c.maxTokens,
+      temperature: c.temperature,
+      system,
+      messages: [{ role: "user", content: prompt }],
+    }
+  }
+  // openai-compatible + ollama (oba używają /chat/completions)
+  const body: any = {
+    model: c.model,
+    max_tokens: c.maxTokens,
+    temperature: c.temperature,
+    messages: [
+      ...(system ? [{ role: "system", content: system }] : []),
+      { role: "user", content: prompt }],
+  }
+  if (jsonMode && c.provider !== "ollama") body.response_format = { type: "json_object" }
+  // Wyłącz reasoning (thinking) dla modeli Qwen3.5/Llama4 — LM Studio honoruje
+  // reasoning_effort:"none"; chat_template_kwargs jest fallbackiem (ignorowane przez LM Studio).
+  if (c.provider === "openai-compatible") {
+    body.reasoning_effort = "none"
+    body.chat_template_kwargs = { enable_thinking: false }
+  }
+  return body
+}
+
+function aiBuildHeaders(c: AIConfig): Record<string, string> {
+  if (c.provider === "anthropic") {
+    return {
+      "content-type": "application/json",
+      "x-api-key": c.apiKey,
+      "anthropic-version": "2023-06-01",
+    }
+  }
+  return {
+    "content-type": "application/json",
+    authorization: `Bearer ${c.apiKey}`,
+  }
+}
+
+function aiUrl(c: AIConfig): string {
+  let base = c.baseUrl.replace(/\/$/, "")
+  if (c.provider === "anthropic") return `${base}/messages`
+  // openai-compatible: auto-dopisz /v1 jeśli brakuje (LM Studio, Ollama-compat).
+  // Ollama natywny ma własny endpoint /api/chat, ale fallback przez /chat/completions.
+  if (c.provider === "openai-compatible" && !/\/v\d+$/.test(base)) {
+    base += "/v1"
+  }
+  return `${base}/chat/completions`
+}
+
+// Ekstrakcja tekstu z odpowiedzi niezależnie od provider'a
+function aiExtractText(c: AIConfig, body: any): string {
+  if (c.provider === "anthropic") {
+    const content = body?.content
+    if (Array.isArray(content)) {
+      return content.map((p: any) => p?.text ?? "").join("")
+    }
+    return ""
+  }
+  // openai-compatible / ollama
+  const choice = body?.choices?.[0]
+  const msg = choice?.message
+  // Preferuj content; fallback na reasoning_content gdy model (np. Qwen3.5) wypluwł
+  // tylko thinking — LM Studio czasem zwraca content:"" i reasoning_content z treścią.
+  // W trybie reasoning_effort:none to nie powinno się zdarzać, ale zostawiamy awaryjnie.
+  const content = msg?.content ?? ""
+  if (content.trim()) return content
+  const reasoning = msg?.reasoning_content ?? ""
+  return reasoning
+}
+
+// Pojedyncze wołanie HTTP z timeoutem. Zwraca tekst lub rzuca.
+async function aiCallOnce(c: AIConfig, system: string, prompt: string, jsonMode: boolean): Promise<string> {
+  const url = aiUrl(c)
+  const headers = aiBuildHeaders(c)
+  const body = JSON.stringify(aiBuildBody(c, system, prompt, jsonMode))
+  const ctrl = new AbortController()
+  // Dynamiczny timeout: dopuszczamy o 50% dłuższy czas niż pierwotny timeoutMs.
+  // Gdy pierwotny limit minie, dostajemy timeoutExtended flag (w aiComplete),
+  // a twardy cutoff następuje dopiero przy 1.5×.
+  const hardTimeout = aiEffectiveTimeoutMs(c)
+  const timer = setTimeout(() => ctrl.abort(), hardTimeout)
+  try {
+    const res = await fetch(url, { method: "POST", headers, body, signal: ctrl.signal })
+    if (!res.ok) {
+      const text = await res.text().catch(() => "")
+      throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+    }
+    const data = await res.json() as any
+    const text = aiExtractText(c, data)
+    if (!text || !text.trim()) throw new Error("empty response")
+    return text
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// Spróbuj sparsować JSON bez rzucania; zwraca null przy błędzie
+function tryParseJson(text: string): any | null {
+  try {
+    // wytnij blok ```json ... ``` jeśli występuje
+    const m = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+    const raw = m ? m[1] : text
+    return JSON.parse(raw.trim())
+  } catch {
+    return null
+  }
+}
+
+// Główna funkcja AI. Zwraca null przy każdym błędzie (nigdy nie rzuca).
+// Wywołujący ma fallback deterministyczny.
+async function aiComplete(opts: {
+  system?: string
+  prompt: string
+  jsonMode?: boolean
+  label?: string
+}): Promise<string | null> {
+  // Circuit breaker: jeśli AI awariuje w pętli, przestań próbować — pozwól
+  // deterministycznym fallbackom działać i nie blokuj runtime'u opencode.
+  if (aiCbShouldSkip()) return null
+  // Ścieżka HTTP: własny fetch z ai config.
+  const c = aiEffectiveConfig()
+  if (!c) return null
+  aiStatus.enabled = true
+  aiStatus.provider = c.provider
+  aiStatus.model = c.model
+
+  const models = [c.model, ...c.fallbackChain]
+  const system = opts.system ?? ""
+  const prompt = opts.prompt
+  const jsonMode = opts.jsonMode ?? false
+
+  // Zasygnalizuj w TUI, że model pracuje — flush synchronicznie, by user
+  // widział czerwony "working…" zanim jakikolwiek await się rozpocznie.
+  aiStatus.busy = true
+  aiStatus.busyLabel = opts.label ?? "processing"
+  aiStatus.busySince = Date.now()
+  aiStatus.configTimeoutMs = c.timeoutMs
+  aiStatus.timeoutWarn = false
+  aiStatus.timeoutExtended = false
+  flushMetrics()
+
+  // Helper: zaktualizuj metryki czasu promptu (wołany po każdej próbie).
+  const recordDuration = (ms: number) => {
+    aiStatus.lastDurationMs = ms
+    const warnThreshold = aiTimeoutWarnThresholdMs(c)
+    aiStatus.timeoutWarn = ms >= warnThreshold
+    aiStatus.timeoutExtended = ms > c.timeoutMs
+    if (ms > aiStatus.maxObservedMs) {
+      aiStatus.maxObservedMs = ms
+      aiSaveMaxObserved(ms)
+    }
+  }
+
+  try {
+    for (let i = 0; i < models.length; i++) {
+      const model = models[i]
+      const cc = { ...c, model }
+      const t0 = Date.now()
+      aiStatus.calls += 1
+      try {
+        let text = await aiCallOnce(cc, system, prompt, jsonMode)
+        // Jeśli JSON mode, zweryfikuj parsowaniem
+        if (jsonMode) {
+          let parsed = tryParseJson(text)
+          if (!parsed) {
+            // retry 1× z temp:0
+            const cc0 = { ...cc, temperature: 0 }
+            aiStatus.calls += 1
+            try {
+              text = await aiCallOnce(cc0, system, prompt, jsonMode)
+              parsed = tryParseJson(text)
+            } catch (e: any) {
+              aiLogError(`retry temp:0 failed (${model}): ${e?.message ?? e}`)
+            }
+            if (!parsed) {
+              aiStatus.failures += 1
+              aiLogError(`bad JSON from ${model}: ${text.slice(0, 200)}`)
+              continue // spróbuj kolejny model z fallbackChain
+            }
+          }
+        }
+        const duration = Date.now() - t0
+        aiStatus.successes += 1
+        aiStatus.lastCallMs = duration
+        aiStatus.lastError = ""
+        recordDuration(duration)
+        aiCbRecordSuccess()
+        return text
+      } catch (e: any) {
+        const duration = Date.now() - t0
+        aiStatus.failures += 1
+        aiStatus.lastCallMs = duration
+        recordDuration(duration)
+        const msg = e?.name === "AbortError" ? `timeout (${aiEffectiveTimeoutMs(cc)}ms)` : safeErrorString(e)
+        aiLogError(`call failed (${model}): ${msg}`)
+        aiCbRecordFailure()
+        // spróbuj kolejny model z fallbackChain (jeśli błąd sieciowy / HTTP)
+        continue
+      }
+    }
+    return null
+  } finally {
+    aiStatus.busy = false
+    aiStatus.busyLabel = ""
+    aiStatus.busySince = 0
+    flushMetrics()
+  }
+}
+
+// Krótki ping do modelu AI przy starcie sesji — weryfikuje czy endpoint
+// odpowiada i działa. Nadpisuje aiStatus wynikiem: active (sukces) / offline
+// (porażka). Stare błędy z poprzedniej sesji są kasowane, by TUI nie pokazywało
+// przestarzałego komunikatu na starcie.
+async function aiHealthCheck(): Promise<void> {
+  const c = aiEffectiveConfig()
+  if (!c) return
+  const t0 = Date.now()
+  aiStatus.busy = true
+  aiStatus.busyLabel = "health check"
+  aiStatus.busySince = Date.now()
+  flushMetrics()
+  try {
+    await aiCallOnce(c, "", "Reply with the single word: ok", false)
+    aiStatus.enabled = true
+    aiStatus.provider = c.provider
+    aiStatus.model = c.model
+    aiStatus.lastCallMs = Date.now() - t0
+    aiStatus.lastError = ""
+    aiStatus.calls = 0
+    aiStatus.successes = 0
+    aiStatus.failures = 0
+    aiStatus.healthState = "active"
+    aiCbRecordSuccess()
+  } catch (e: any) {
+    aiStatus.enabled = true
+    aiStatus.provider = c.provider
+    aiStatus.model = c.model
+    aiStatus.lastCallMs = Date.now() - t0
+    const msg = e?.name === "AbortError" ? `timeout (${c.timeoutMs}ms)` : safeErrorString(e)
+    aiStatus.lastError = msg
+    aiStatus.calls = 0
+    aiStatus.successes = 0
+    aiStatus.failures = 1
+    aiStatus.healthState = "offline"
+    aiLogError(`health check failed: ${msg}`)
+    aiCbRecordFailure()
+  } finally {
+    aiStatus.busy = false
+    aiStatus.busyLabel = ""
+    aiStatus.busySince = 0
+    flushMetrics()
+  }
+}
+function aiStatusText(): string {
+  if (!aiStatus.enabled && !aiEffectiveConfig()) {
+    return [
+      "AI: wyłączone.",
+      "Aby włączyć, dodaj w opencode.json plugin options:",
+      '  "ai": { "enabled": true, "provider": "openai-compatible", "apiKey": "${OPENAI_API_KEY}", "model": "gpt-4o-mini" }',
+      "Inni providerzy: \"ollama\" (lokalny, bez apiKey), \"anthropic\".",
+    ].join("\n")
+  }
+  const lines: string[] = []
+  const eff = aiEffectiveConfig()
+  const enabled = aiStatus.enabled || !!eff
+  lines.push(`AI: ${enabled ? "włączone" : "wyłączone (brak apiKey)"}`)
+  lines.push(`Provider: ${eff?.provider ?? aiStatus.provider}`)
+  lines.push(`Model: ${eff?.model ?? aiStatus.model}`)
+  lines.push(`Wołania: ${aiStatus.calls} (sukces: ${aiStatus.successes}, porażka: ${aiStatus.failures})`)
+  lines.push(`Ostatni czas: ${aiStatus.lastCallMs}ms`)
+  // Dynamiczny timeout
+  const cfgTimeout = eff?.timeoutMs ?? aiStatus.configTimeoutMs ?? 0
+  const hardLimit = cfgTimeout > 0 ? Math.round(cfgTimeout * 1.5) : 0
+  lines.push(`Timeout: ${cfgTimeout}ms (twardy limit 1.5×: ${hardLimit}ms)`)
+  if (aiStatus.maxObservedMs > 0) {
+    lines.push(`Najdłuższy prompt: ${aiStatus.maxObservedMs}ms`)
+  }
+  if (aiStatus.timeoutExtended) {
+    lines.push(`⚠ Ostatni prompt przekroczył pierwotny limit (${cfgTimeout}ms) — wymaga wydłużenia.`)
+  } else if (aiStatus.timeoutWarn) {
+    lines.push(`⚠ Ostatni prompt zbliżył się do limitu (≥80% ${cfgTimeout}ms) — może wymagać wydłużenia.`)
+  }
+  lines.push(aiStatus.lastError ? `Ostatni błąd: ${aiStatus.lastError}` : "Brak błędów.")
+  if (aiStatus.failures > 0) lines.push("Fallback deterministyczny aktywny (AI nie przeszkadza).")
+  lines.push("Komenda: /codemem ai auto-timeout — wydłuża timeout do max×1.3")
+  return lines.join("\n")
+}
+
+// --- AI-enhanced: triage ostatnich failed tests -------------------------------
+// Analizuje logi nieudanych testów i proponuje root cause. Fallback: deterministyczna lista.
+async function aiTriageFailedTests(): Promise<string> {
+  const fails = testHistory.filter((t) => t.exitCode !== 0).slice(-3)
+  if (!fails.length) return "Brak nieudanych testów w historii."
+  const ctx = fails.map((t) => {
+    return `## ${t.command} (exit ${t.exitCode}, ${t.timestamp})\nSummary: ${t.summary}\nFailed: ${t.failed.slice(0, 5).join(", ")}`
+  }).join("\n\n")
+  const system = "Jesteś inżynierem QA. Analizujesz logi nieudanych testów i wskazujesz prawdopodobny root cause. Odpowiadaj zwięźle po polsku, max 5 punktów."
+  const prompt = `Oto ostatnie nieudane testy:\n\n${ctx}\n\nWymień prawdopodobne root causes (max 5, krótko):`
+  const out = await aiComplete({ system, prompt, label: "triage failed tests" })
+  if (!out) {
+    // fallback deterministyczny
+    return ["AI triage niedostępne. Ostatnie nieudane testy:", "", ctx].join("\n")
+  }
+  return out
+}
+
+// --- AI-enhanced: podsumowanie sesji do handoffa -------------------------------
+// Zwraca krótki status (1-2 zdania) na bazie edytowanych plików + testów. Fallback: puste.
+async function aiSummarizeSession(edits: string[], testStatus?: { command: string; exitCode: number; summary: string }, extra?: { decisions?: string[]; blockers?: string[] }): Promise<string> {
+  const bits: string[] = []
+  if (edits.length) bits.push(`Edytowane pliki: ${edits.slice(0, 10).join(", ")}`)
+  if (testStatus) bits.push(`Test: ${testStatus.command} (exit ${testStatus.exitCode}): ${testStatus.summary}`)
+  if (extra?.decisions?.length) bits.push(`Decyzje: ${extra.decisions.join(" | ")}`)
+  if (extra?.blockers?.length) bits.push(`Blokery: ${extra.blockers.join(" | ")}`)
+  if (!bits.length) return ""
+  const system = "Jesteś asystentem dev. Podsumuj krótko stan sesji (1-2 zdania po polsku)."
+  const prompt = `Stan sesji:\n${bits.join("\n")}\n\nPodsumuj krótko co zrobiono i na czym stiano:`
+  const out = await aiComplete({ system, prompt, label: "summarize session" })
+  return out ?? ""
+}
+
+// --- AI-enhanced: ekstrakcja konwencji/ryzyka z README/CLAUDE.md ---------------
+// Zwraca listę faktów "ludzkich" wykrytych z dokumentacji. Fallback: puste (auto-fakty deterministyczne wystarczą).
+// Zmiana: wywołanie tylko gdy pliki źródłowe uległy zmianie (hash w cache). Bez throttlingu czasowego.
+
+function aiFactsHashPath(): string {
+  return join(memoryDir, "cache", "ai-facts-hash.json")
+}
+
+function computeDocsHash(root: string): string {
+  const candidates = ["README.md", "CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"]
+  const h = createHash("sha256")
+  for (const f of candidates) {
+    const p = join(root, f)
+    if (existsSync(p)) h.update(readText(p))
+  }
+  return h.digest("hex")
+}
+
+function aiHumanFactsChanged(root: string): boolean {
+  const hash = computeDocsHash(root)
+  const data = readJson<{ hash?: string } | null>(aiFactsHashPath())
+  if (data?.hash === hash) return false
+  try { writeJson(aiFactsHashPath(), { hash }) } catch { /* swallow */ }
+  return true
+}
+
+async function aiExtractHumanFacts(root: string): Promise<string> {
+  if (!aiHumanFactsChanged(root)) return ""
+  const candidates = ["README.md", "CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"]
+  const docs: string[] = []
+  for (const f of candidates) {
+    const p = join(root, f)
+    if (existsSync(p)) {
+      const raw = readText(p)
+      if (raw) docs.push(`## ${f}\n${truncateLines(raw, 200)}`)
+    }
+  }
+  if (!docs.length) return ""
+  const system = "Ekstrahuj konwencje, ryzyka i decyzje architektoniczne z dokumentacji projektu. Odpowiadaj po polsku w formacie Markdown z sekcjami ## Konwencje, ## Ryzyka. Brak = puste sekcje."
+  const prompt = `Dokumentacja projektu:\n\n${docs.join("\n\n")}\n\nWymień konwencje kodowania, ryzyka i decyzje architektoniczne (max 10 punktów łącznie):`
+  const out = await aiComplete({ system, prompt, label: "extract human facts" })
+  return out ?? ""
+}
+
+// ---------------------------------------------------------------------------
 // Memory layout
 // ---------------------------------------------------------------------------
 
@@ -379,6 +1111,8 @@ function initMemoryLayout(worktree: string) {
   loadDedupCache()
   loadTestHistory()
   loadSessionTrace()
+  // AI: load persistent max observed prompt duration (for dynamic timeout)
+  aiStatus.maxObservedMs = aiLoadMaxObserved()
 }
 
 function factsPath(): string {
@@ -543,6 +1277,79 @@ function extractEnvironment(root: string): string[] {
     const fm = raw.match(/FROM\s+([^\s]+)/i)
     if (fm) out.push(`Container base: ${fm[1]}  (Dockerfile)`)
   }
+  // Host OS + WSL hint (deterministic, no shell call)
+  const hostOs = process.platform
+  const hostOsLabel = hostOs === "win32" ? "Windows" : hostOs === "linux" ? "Linux" : hostOs === "darwin" ? "macOS" : hostOs
+  out.push(`Host OS: ${hostOsLabel}  (process.platform=${hostOs})`)
+  if (hostOs === "linux" && existsSync("/proc/sys/fs/binfmt_misc/WSLInterop")) {
+    out.push("Runtime: WSL (binfmt WSLInterop wykryty)")
+  }
+  // WSL detection on Windows: sprawdz presence wsl.exe w PATH + skrypty *.sh obok *.ps1
+  if (hostOs === "win32") {
+    const hasSh = existsSync(join(root, "install.sh")) || existsSync(join(root, "scripts", "install.sh"))
+    const hasPs1 = existsSync(join(root, "install.ps1")) || existsSync(join(root, "scripts", "install.ps1"))
+    if (hasSh && hasPs1) out.push("Build env: cross-platform shell (WSL + PowerShell)  (*.sh + *.ps1)")
+    else if (hasSh) out.push("Build env: WSL/bash wymagany  (*.sh bez *.ps1)")
+  }
+  return out
+}
+
+// --- Target platform (CI matrix, desktop/mobile wrappers, tsconfig lib) --------
+function extractTargetPlatform(root: string): string[] {
+  const out: string[] = []
+  // GitHub Actions matrix.os / runs-on
+  const ghDir = join(root, ".github", "workflows")
+  if (existsSync(ghDir)) {
+    try {
+      const osSet = new Set<string>()
+      for (const f of readdirSync(ghDir)) {
+        if (!f.endsWith(".yml") && !f.endsWith(".yaml")) continue
+        const raw = readText(join(ghDir, f))
+        // runs-on: ubuntu-latest / matrix.os: [ubuntu-latest, windows-latest, macos-latest]
+        for (const m of raw.matchAll(/(?:runs-on|os):\s*\[?["'`]?([a-z]+-latest)["'`\]?,]?/gi)) {
+          if (m[1]) osSet.add(m[1])
+        }
+      }
+      if (osSet.size) out.push(`CI matrix: ${Array.from(osSet).join(", ")}  (.github/workflows)`)
+    } catch { /* ignore */ }
+  }
+  // Desktop/mobile wrappers
+  if (existsSync(join(root, "electron-builder.yml")) || existsSync(join(root, "electron-builder.json")) || existsSync(join(root, "electron-builder.config.js"))) {
+    out.push("Target: Electron desktop  (electron-builder)")
+  }
+  if (existsSync(join(root, "tauri.conf.json")) || existsSync(join(root, "src-tauri", "tauri.conf.json"))) {
+    out.push("Target: Tauri desktop  (tauri.conf.json)")
+  }
+  if (existsSync(join(root, "capacitor.config.ts")) || existsSync(join(root, "capacitor.config.json"))) {
+    out.push("Target: Capacitor mobile  (capacitor.config)")
+  }
+  if (existsSync(join(root, "expo.json")) || existsSync(join(root, "app.json"))) {
+    const aj = readJsonManifest(root, "app.json")
+    if (aj?.expo) out.push("Target: Expo/React Native mobile  (app.json expo)")
+  }
+  // package.json os/cpu constraints + bin hints
+  const pkg = readJsonManifest(root, "package.json")
+  if (pkg) {
+    if (Array.isArray(pkg.os) && pkg.os.length) out.push(`Target os: ${pkg.os.join(", ")}  (package.json os)`)
+    if (Array.isArray(pkg.cpu) && pkg.cpu.length) out.push(`Target cpu: ${pkg.cpu.join(", ")}  (package.json cpu)`)
+    if (pkg.main && /^dist\/(electron|tauri|desktop)/.test(pkg.main)) out.push(`Target: desktop  (package.json main=${pkg.main})`)
+  }
+  // tsconfig.json lib (browser vs node target)
+  const tscfg = join(root, "tsconfig.json")
+  if (existsSync(tscfg)) {
+    try {
+      const raw = readText(tscfg)
+      const libMatch = raw.match(/"lib"\s*:\s*\[([^\]]+)\]/)
+      if (libMatch) {
+        const libs = libMatch[1].replace(/["' ]/g, "").split(",").filter(Boolean)
+        const hasDom = libs.some((l) => l.toLowerCase().startsWith("dom"))
+        const hasNode = libs.some((l) => l.toLowerCase().includes("node"))
+        if (hasDom && hasNode) out.push("tsconfig lib: DOM+Node  (hybrid/browser+node)")
+        else if (hasDom) out.push("tsconfig lib: DOM  (browser target)")
+        else if (hasNode) out.push("tsconfig lib: Node  (node target)")
+      }
+    } catch { /* ignore */ }
+  }
   return out
 }
 
@@ -590,6 +1397,7 @@ function buildAutoFacts(): string {
   const root = worktreePath || projectRoot || process.cwd()
   const cmds = extractBuildAndTestCommands(root)
   const env = extractEnvironment(root)
+  const platform = extractTargetPlatform(root)
   const arch = extractArchitecture(root)
   const out: string[] = []
   out.push("# project-facts.auto.md — generowane automatycznie przez plugin")
@@ -613,6 +1421,11 @@ function buildAutoFacts(): string {
   if (env.length) {
     out.push("## Środowisko")
     for (const e of env) out.push(`- ${e}`)
+    out.push("")
+  }
+  if (platform.length) {
+    out.push("## Platforma docelowa")
+    for (const p of platform) out.push(`- ${p}`)
     out.push("")
   }
   return out.join("\n")
@@ -675,18 +1488,18 @@ function loadDedupCache() {
   if (!cfg.persistentDedupCache) return
   const data = readJson<SeenContext[]>(dedupCachePath())
   if (Array.isArray(data)) {
-    seen = data
+    seen = new Map(data.map((s) => [dedupKey(s), s]))
   }
 }
 
 function saveDedupCache() {
   if (!cfg.persistentDedupCache) return
   // LRU eviction by deliveredAt (oldest first) when over capacity
-  if (seen.length > cfg.maxDedupCacheEntries) {
-    seen.sort((a, b) => (a.deliveredAt < b.deliveredAt ? -1 : 1))
-    seen = seen.slice(seen.length - cfg.maxDedupCacheEntries)
+  if (seen.size > cfg.maxDedupCacheEntries) {
+    const entries = Array.from(seen.values()).sort((a, b) => (a.deliveredAt < b.deliveredAt ? -1 : 1))
+    seen = new Map(entries.slice(entries.length - cfg.maxDedupCacheEntries).map((s) => [dedupKey(s), s]))
   }
-  writeJson(dedupCachePath(), seen)
+  writeJson(dedupCachePath(), Array.from(seen.values()))
 }
 
 // --- Additions: load / save test history --------------------------------------
@@ -842,6 +1655,41 @@ function buildProposedFacts(): string {
     out.push("")
   }
 
+  // Heurystyka trudnych problemów: ≥3 uruchomienia tego samego command, z czego
+  // przynajmniej jedno nieudane (exitCode!=0) i ostatnie udane (exitCode==0).
+  // Sugeruje, że problem rozwiązano po iteracjach — warte zapisania lekcji.
+  const byCmd: Record<string, TestRun[]> = {}
+  for (const t of testHistory) {
+    const key = t.command
+    if (!byCmd[key]) byCmd[key] = []
+    byCmd[key].push(t)
+  }
+  const hardProblems: string[] = []
+  for (const [cmd, runs] of Object.entries(byCmd)) {
+    if (runs.length < 3) continue
+    const hasFail = runs.some((r) => r.exitCode !== 0)
+    const lastOk = runs[runs.length - 1].exitCode === 0
+    if (!hasFail || !lastOk) continue
+    // zbierz unikalne failed test names z nieudanych runów
+    const failedNames = new Set<string>()
+    for (const r of runs) {
+      if (r.exitCode !== 0) for (const f of r.failed) failedNames.add(f)
+    }
+    const firstTs = runs[0].timestamp.slice(0, 10)
+    const lastTs = runs[runs.length - 1].timestamp.slice(0, 10)
+    const span = firstTs === lastTs ? firstTs : `${firstTs}..${lastTs}`
+    const failedBit = failedNames.size ? ` (failed: ${Array.from(failedNames).slice(0, 3).join(", ")})` : ""
+    hardProblems.push(`- ${cmd}: rozwiązano po ${runs.length} iteracjach [${span}]${failedBit}`)
+  }
+  if (hardProblems.length) {
+    added = true
+    out.push("## Trudne problemy (heurystyka: ≥3 iteracje build/test → sukces)")
+    out.push(...hardProblems)
+    out.push("")
+    out.push("> Jeśli któryś z tych problemów był nieoczywisty, rozważ: /codemem lesson <krótki opis problem+rozwiązanie+why>")
+    out.push("")
+  }
+
   if (!added) {
     out.push("(brak danych — uruchom kilka sesji z buildem/testami i edycją plików, aby plugin zebrał statystyki)")
   }
@@ -852,21 +1700,53 @@ function commitProposedFacts(): string {
   const proposed = buildProposedFacts()
   const existing = readText(factsPath())
   const sep = existing.endsWith("\n") ? "\n" : existing ? "\n\n" : ""
-  const merged = existing + sep + "\n<!-- === propozycje pluginu (dodane /memory commit) === -->\n" + proposed
+  const merged = existing + sep + "\n<!-- === propozycje pluginu (dodane /codemem commit) === -->\n" + proposed
   writeFileSync(factsPath(), merged, "utf8")
   // clear the proposed buffer by resetting trace (keep history though)
   rmSync(proposedFactsPath(), { force: true })
   return "Propozycje dopisane do project-facts.md. Przejrzyj i edytuj ręcznie, aby zachować zwięzłość."
 }
 
+// --- /codemem lesson: ręczne dopisywanie lekcji (trudne problemy, decisions) ---
+// Lekcje lądują w wersjonowanym project-facts.md w sekcji "## Lekcje".
+// Krótkie, z datą — dla przyszłych sesji, które natrafiają na podobny problem.
+function memoryLesson(text: string): string {
+  const t = (text || "").trim()
+  if (!t) return "Użycie: /codemem lesson <opis lekcji>. Krótko: problem + rozwiązanie + dlaczego."
+  if (t.length > 600) return "Lekcja za długa (>600 znaków). Skróć do istotnego problem+rozwiązanie+why."
+  const existing = readText(factsPath())
+  const ts = new Date().toISOString().slice(0, 10)
+  const line = `- [${ts}] ${t}`
+  if (existing.includes("## Lekcje")) {
+    // dopisz pod istniejącą sekcją
+    const idx = existing.indexOf("## Lekcje")
+    const nextHeader = existing.indexOf("\n## ", idx + 1)
+    const insertAt = nextHeader === -1 ? existing.length : nextHeader
+    const before = existing.slice(0, insertAt).replace(/\n*$/, "\n")
+    const after = existing.slice(insertAt)
+    const merged = before + line + "\n" + (after.startsWith("\n") ? after : "\n" + after)
+    writeFileSync(factsPath(), merged, "utf8")
+  } else {
+    const sep = existing.endsWith("\n") ? "\n" : existing ? "\n\n" : ""
+    const header = existing ? "## Lekcje\n" : "# project-facts.md\n\n## Lekcje\n"
+    writeFileSync(factsPath(), existing + sep + header + line + "\n", "utf8")
+  }
+  return `Lekcja dopisana do project-facts.md (## Lekcje):\n${line}`
+}
+
 // ---------------------------------------------------------------------------
 // project-facts.md
 // ---------------------------------------------------------------------------
 
+function factsAiPath(): string {
+  return join(memoryDir, "project-facts.ai.md")
+}
+
 function readProjectFacts(): string {
   const raw = readText(factsPath())
   const auto = cfg.autoExtractFacts ? readAutoFacts() : ""
-  const merged = [auto, raw].filter(Boolean).join("\n\n---\n\n")
+  const ai = cfg.ai?.enabled ? readText(factsAiPath()) : ""
+  const merged = [auto, ai, raw].filter(Boolean).join("\n\n---\n\n")
   if (!merged) return ""
   const tokens = estimateTokens(merged)
   if (tokens > cfg.maxProjectMemoryTokens) {
@@ -909,6 +1789,19 @@ function writeActiveSession(s: ActiveSession) {
 
 async function gitInfo($: any): Promise<{ branch: string; head: string; modified: string[]; recentDiff: string[] }> {
   const empty = { branch: "", head: "", modified: [], recentDiff: [] }
+  // `$` (Bun shell) may be unavailable in some plugin runtimes — fall back to execSync
+  if (typeof $ !== "function") {
+    try {
+      const branch = execSync(`git -C ${JSON.stringify(worktreePath)} rev-parse --abbrev-ref HEAD`, { encoding: "utf8" }).trim() || "(detached)"
+      const head = execSync(`git -C ${JSON.stringify(worktreePath)} rev-parse --short HEAD`, { encoding: "utf8" }).trim()
+      const recentDiff = (gitFilesChangedBetween("HEAD~20", "HEAD").length
+        ? gitFilesChangedBetween("HEAD~20", "HEAD")
+        : gitFilesChangedBetween("", "HEAD")).slice(0, 20)
+      return { branch, head, modified: gitStatusPorcelain(), recentDiff }
+    } catch {
+      return empty
+    }
+  }
   try {
     const branch = (await $`git -C ${worktreePath} rev-parse --abbrev-ref HEAD`.text()).trim() || "(detached)"
     const head = (await $`git -C ${worktreePath} rev-parse --short HEAD`.text()).trim()
@@ -917,7 +1810,7 @@ async function gitInfo($: any): Promise<{ branch: string; head: string; modified
       .split("\n")
       .filter(Boolean)
       .map((l: string) => l.slice(3).trim())
-    const diffRaw = (await $`git -C ${worktreePath} diff --name-only HEAD~20 2>/dev/null || git -C ${worktreePath} diff --name-only`.text()).trim()
+    const diffRaw = (await $`git -C ${worktreePath} diff --name-only HEAD~20 2>/dev/null || git -C ${worktreePath} diff --name-only HEAD 2>/dev/null || true`.text()).trim()
     const recentDiff = diffRaw.split("\n").filter(Boolean).slice(0, 20)
     return { branch, head, modified, recentDiff }
   } catch {
@@ -940,7 +1833,7 @@ function getHeadSha(): string {
 function gitFilesChangedBetween(fromSha: string, toSha: string): string[] {
   try {
     const range = fromSha && toSha ? `${fromSha}..${toSha}` : toSha || "HEAD"
-    const out = execSync(`git -C ${JSON.stringify(worktreePath)} diff --name-only ${range}`, { encoding: "utf8" })
+    const out = execSync(`git -C ${JSON.stringify(worktreePath)} diff --name-only ${range}`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
     return out.split("\n").filter(Boolean)
   } catch {
     return []
@@ -981,6 +1874,268 @@ function gitCheckoutFileFromSha(sha: string, file: string): string {
   } catch (e: any) {
     return `Nie udało się przywrócić ${file}: ${e?.message ?? e}`
   }
+}
+
+// --- Feature marks via git notes ----------------------------------------------
+// Feature = zdefiniowana nazwa opcji/mechanizmu. Oznaczenie „działa poprawnie"
+// zapisujemy jako notę (git notes) na konkretnym commicie, więc znika potrzeba
+// przepisywania historii — punkt odniesienia = commit, na którym feature został
+// oznaczony. Notesy kumulujemy przez `git notes append` (jedna nota na commit).
+
+function gitNotesAppend(sha: string, message: string): string {
+  // Uwaga (Windows): przekazywanie nowych linii przez -m nie jest pewne (shell
+  // zamienia je na literalne \n). Dlatego nota idzie przez plik tymczasowy (-F).
+  const tmpFile = join(tmpdir(), `opencode-note-${createHash("sha1").update(sha + Date.now()).digest("hex").slice(0, 16)}.txt`)
+  try {
+    writeFileSync(tmpFile, message, "utf8")
+    execSync(
+      `git -C ${JSON.stringify(worktreePath)} notes append -F ${JSON.stringify(tmpFile)} ${sha}`,
+      { encoding: "utf8", stdio: "pipe" },
+    )
+    return `Oznaczono ${sha.slice(0, 7)}.`
+  } catch (e: any) {
+    return `git notes append failed: ${e?.message ?? e}`
+  } finally {
+    try { unlinkSync(tmpFile) } catch { /* ignore */ }
+  }
+}
+
+function gitNotesShow(sha: string): string {
+  try {
+    return execSync(
+      `git -C ${JSON.stringify(worktreePath)} notes show ${sha}`,
+      { encoding: "utf8", stdio: "pipe" },
+    ).trim()
+  } catch {
+    return ""
+  }
+}
+
+// Zwraca listę { note, commit } — commitów, które mają noty w refs/notes/commits.
+function gitNotesList(): { note: string; commit: string }[] {
+  try {
+    const out = execSync(`git -C ${JSON.stringify(worktreePath)} notes list`, { encoding: "utf8", stdio: "pipe" })
+    return out
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        const [note, commit] = l.trim().split(/\s+/)
+        return { note: note ?? "", commit: commit ?? "" }
+      })
+      .filter((x) => x.commit)
+  } catch {
+    return []
+  }
+}
+
+// commitSha -> { date, subject } dla wszystkich commitów (także na innych gałęziach).
+function gitLogMap(): Record<string, { date: string; subject: string }> {
+  const map: Record<string, { date: string; subject: string }> = {}
+  try {
+    const out = execSync(
+      `git -C ${JSON.stringify(worktreePath)} log --all --format=%H%x09%ct%x09%s`,
+      { encoding: "utf8", stdio: "pipe" },
+    )
+    for (const l of out.split("\n").filter(Boolean)) {
+      const [sha, ct, ...rest] = l.split("\t")
+      if (!sha) continue
+      map[sha] = {
+        date: new Date(Number(ct) * 1000).toISOString(),
+        subject: rest.join("\t"),
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return map
+}
+
+function gitDiffText(fromSha: string, toSha: string): string {
+  try {
+    return execSync(
+      `git -C ${JSON.stringify(worktreePath)} diff --stat --patch ${fromSha}..${toSha}`,
+      { encoding: "utf8", stdio: "pipe" },
+    )
+  } catch (e: any) {
+    return `git diff failed: ${e?.message ?? e}`
+  }
+}
+
+// --- Feature registry (lokalna definicja feature'ów) --------------------------
+
+type FeatureDef = { name: string; description: string; createdAt: string }
+
+function featuresPath(): string {
+  return join(memoryDir, "cache", "features.json")
+}
+
+function readFeatures(): Record<string, FeatureDef> {
+  return readJson<Record<string, FeatureDef>>(featuresPath()) ?? {}
+}
+
+function writeFeatures(features: Record<string, FeatureDef>) {
+  writeJson(featuresPath(), features)
+}
+
+// Parseuje noty (append kumuluje bloki rozdzielone pustą linią) i zwraca listę
+// oznaczeń: { feature, status, sha, date, note, commit }.
+function parseFeatureMarks(): {
+  feature: string
+  status: string
+  sha: string
+  date: string
+  note: string
+  commit: string
+}[] {
+  const logMap = gitLogMap()
+  const out: { feature: string; status: string; sha: string; date: string; note: string; commit: string }[] = []
+  for (const { commit } of gitNotesList()) {
+    const text = gitNotesShow(commit)
+    if (!text) continue
+    for (const block of text.split(/\n\n+/)) {
+      const feature = block.match(/^feature:(\S+)$/m)?.[1]
+      if (!feature) continue
+      const status = block.match(/^status=(\S+)$/m)?.[1] ?? ""
+      const sha = block.match(/^sha=(\S+)$/m)?.[1] ?? ""
+      out.push({
+        feature,
+        status,
+        sha,
+        date: logMap[commit]?.date ?? "",
+        note: block,
+        commit,
+      })
+    }
+  }
+  return out
+}
+
+// Znajdź najnowszy commit (wg daty commita), na którym feature był oznaczony ok.
+function lastKnownGoodForFeature(name: string): { commit: string; date: string; sha: string; note: string } | null {
+  const marks = parseFeatureMarks().filter((m) => m.feature === name && m.status === "ok")
+  if (!marks.length) return null
+  let best: (typeof marks)[number] | null = null
+  for (const m of marks) {
+    if (!best || m.date > best.date) best = m
+  }
+  if (!best) return null
+  return { commit: best.commit, date: best.date, sha: best.sha, note: best.note }
+}
+
+// --- /regression feature: definiowanie i weryfikacja feature'ów ---------------
+
+function regressionFeature(args: string): string {
+  const parts = args.trim().split(/\s+/).filter(Boolean)
+  const sub = parts[0] ?? ""
+  const rest = parts.slice(1).join(" ")
+
+  if (sub === "add") {
+    const name = parts[1] ?? ""
+    if (!name) return "Użycie: /regression feature add <nazwa> [opis]"
+    const features = readFeatures()
+    if (features[name]) return `Feature "${name}" już istnieje. Użyj /regression feature list.`
+    features[name] = { name, description: rest.replace(/^[^ ]+/, "").trim(), createdAt: new Date().toISOString() }
+    writeFeatures(features)
+    return `Dodano feature "${name}".\nAby oznaczyć go jako działający na HEAD: /regression feature mark ${name}`
+  }
+
+  if (sub === "list") {
+    const features = readFeatures()
+    const entries = Object.values(features)
+    if (!entries.length) return "Brak zdefiniowanych feature'ów. Użyj: /regression feature add <nazwa> [opis]"
+    const lines = ["=== Zdefiniowane feature'y ==="]
+    for (const f of entries) {
+      const known = lastKnownGoodForFeature(f.name)
+      lines.push(`- ${f.name}${f.description ? ` — ${f.description}` : ""} [${known ? `ok @ ${known.commit.slice(0, 7)}` : "nieoznaczony"}]`)
+    }
+    return lines.join("\n")
+  }
+
+  if (sub === "mark") {
+    const name = parts[1] ?? ""
+    if (!name) return "Użycie: /regression feature mark <nazwa> [uwaga]"
+    const features = readFeatures()
+    if (!features[name]) {
+      return `Nieznany feature "${name}". Najpierw go zdefiniuj: /regression feature add ${name}`
+    }
+    const head = getHeadSha()
+    if (!head) return "Nie udało się odczytać HEAD."
+    const existing = gitNotesShow(head)
+    const already = existing.split(/\n\n+/).some((b) => b.includes(`feature:${name}`) && b.includes("status=ok") && b.includes(`sha=${head}`))
+    if (already) return `Feature "${name}" jest już oznaczony jako działający na HEAD (${head.slice(0, 7)}).`
+    const userNote = rest.replace(/^[^ ]+/, "").trim().replace(/\s+/g, " ")
+    const msg = [
+      `feature:${name}`,
+      `status=ok`,
+      `sha=${head}`,
+      `date=${new Date().toISOString()}`,
+      userNote ? `note=${userNote}` : "",
+    ].filter(Boolean).join("\n")
+    const res = gitNotesAppend(head, msg)
+    return `${res}\nFeature "${name}" oznaczony jako DZIAŁAJĄCY na commicie ${head.slice(0, 7)}.`
+  }
+
+  if (sub === "check") {
+    const name = parts[1] ?? ""
+    if (!name) return "Użycie: /regression feature check <nazwa>"
+    const features = readFeatures()
+    if (!features[name]) {
+      return `Nieznany feature "${name}". Najpierw go zdefiniuj: /regression feature add ${name}`
+    }
+    const head = getHeadSha()
+    const known = lastKnownGoodForFeature(name)
+    const lines: string[] = [`=== Feature: ${name} ===`]
+    if (features[name].description) lines.push(`Opis: ${features[name].description}`)
+
+    if (!known) {
+      lines.push("Ten feature NIGDY nie był oznaczony jako działający w środowisku docelowym.")
+      lines.push(`Aby to zrobić po weryfikacji: /regression feature mark ${name}`)
+      return lines.join("\n")
+    }
+
+    const knownShort = known.commit.slice(0, 7)
+    if (known.commit === head) {
+      lines.push(`Oznaczony jako DZIAŁAJĄCY w HEAD (${knownShort}, ${known.date.slice(0, 19).replace("T", " ")}).`)
+      lines.push("Brak zmian od ostatniej weryfikacji — brak podejrzeń o regresję.")
+      return lines.join("\n")
+    }
+
+    const logMap = gitLogMap()
+    const knownSubject = logMap[known.commit]?.subject ?? "(brak tematu)"
+    const commits = gitCommitsBetween(known.commit, head)
+    const files = gitFilesChangedBetween(known.commit, head)
+    const diff = truncateLines(gitDiffText(known.commit, head), 200)
+
+    lines.push(`Ostatnio oznaczony jako DZIAŁAJĄCY: ${knownShort} (${knownSubject}, ${known.date.slice(0, 19).replace("T", " ")})`)
+    lines.push(`Okno zmian: ${knownShort}..HEAD — ${commits.length} commitów, ${files.length} plików`)
+    lines.push("")
+    lines.push("Commity w oknie:")
+    for (const c of commits.slice(0, 20)) lines.push(`  ${c}`)
+    lines.push("")
+    lines.push("Zmienione pliki:")
+    for (const f of files.slice(0, 40)) lines.push(`  ${f}`)
+    lines.push("")
+    lines.push("=== Prompt dla modelu kodującego ===")
+    lines.push(`Mam feature "${name}"${features[name].description ? ` (${features[name].description})` : ""}, który był `)
+    lines.push(`oznaczony jako działający poprawnie w commicie ${knownShort} (${knownSubject}, ${known.date}).`)
+    lines.push(`Od tego commita do HEAD (${commits.length} commitów, ${files.length} plików) wprowadzono zmiany, `)
+    lines.push(`które mogły spowodować regresję. Przeanalizuj TYLKO zmiany poniżej i wskaż, która z nich `)
+    lines.push(`mogła złamać feature "${name}" — nie analizuj całego kodu.`)
+    lines.push("")
+    lines.push("Zmiany (diff):")
+    lines.push("```diff")
+    lines.push(diff || "(brak diffa)")
+    lines.push("```")
+    return lines.join("\n")
+  }
+
+  return [
+    "Użycie: /regression feature <podkomenda>",
+    "  add <nazwa> [opis]        — zdefiniuj feature",
+    "  list                      — lista zdefiniowanych feature'ów + status",
+    "  mark <nazwa> [uwaga]      — oznacz feature jako działający na HEAD (git notes)",
+    "  check <nazwa>             — sprawdź czy był oznaczony; pokaż zmiany od znanego-dobrego commita + prompt dla modelu",
+  ].join("\n")
 }
 
 // Znajdź „last good run" i „first red run" po pierwszym niepustymfailed test name.
@@ -1384,14 +2539,14 @@ function summarizeSearch(result: string): string {
 function dedupeRead(filePath: string, content: string, lineStart?: number, lineEnd?: number): string | null {
   if (!cfg.deduplicateReadResults) return content
   const h = hashContent(content)
-  const rangeKey = `${filePath}:${lineStart ?? 0}-${lineEnd ?? "end"}`
-  const existing = seen.find((s) => s.filePath === filePath && s.contentHash === h && `${s.filePath}:${s.lineStart ?? 0}-${s.lineEnd ?? "end"}` === rangeKey)
+  const key = dedupKey({ filePath, contentHash: h, lineStart, lineEnd })
+  const existing = seen.get(key)
   if (existing) {
     metrics.deduplicatedReads += 1
     metrics.dedupSavedChars += content.length
     return `Already delivered in this session (hash: ${h.slice(0, 8)}, source: ${existing.source}, at ${existing.deliveredAt}). Use read_artifact or read again explicitly if needed.`
   }
-  seen.push({ filePath, contentHash: h, lineStart, lineEnd, deliveredAt: new Date().toISOString(), source: "read" })
+  seen.set(key, { filePath, contentHash: h, lineStart, lineEnd, deliveredAt: new Date().toISOString(), source: "read" })
   return content
 }
 
@@ -1495,29 +2650,63 @@ function dirSizeBytes(dir: string): number {
   return total
 }
 
+const FLUSH_METRICS_MIN_INTERVAL_MS = 2000
+let lastFlushMetricsAt = 0
+
 function flushMetrics() {
+  // Lekkie metryki: liczniki, estymaty, AI — bez git/stat/IO poza writeJson.
+  // Ciężkie (git, stat, regression) aktualizowane tylko przez flushMetricsHeavy()
+  // na sesja.created/idle/compacted — nie przy każdym tool callu.
+  const now = Date.now()
+  if (now - lastFlushMetricsAt < FLUSH_METRICS_MIN_INTERVAL_MS) return
+  lastFlushMetricsAt = now
   metrics.estimatedReductionPercent = metrics.rawChars > 0
     ? +(((metrics.rawChars - metrics.deliveredChars) / metrics.rawChars) * 100).toFixed(1)
     : 0
   metrics.estimatedSavedChars = Math.max(0, metrics.rawChars - metrics.deliveredChars) + metrics.dedupSavedChars
   metrics.estimatedSavedTokens = Math.round(metrics.estimatedSavedChars / 4)
-  // --- TUI live stats ---
   metrics.contextTokens = lastContextTokens
   metrics.contextLimit = effectiveContextLimit()
   metrics.compactThresholdPct = cfg.compactThreshold
   metrics.compactMode = cfg.compactMode
+  metrics.diskLimitBytes = MAX_ARTIFACT_DIR_MB * 1024 * 1024
+  metrics.dedupCacheMax = cfg.maxDedupCacheEntries
+  metrics.dedupCacheCount = seen.size
+  metrics.testHistoryMax = cfg.maxTestHistoryEntries
+  // --- AI live stats (lekkie, tylko kopiowanie z aiStatus) ---
+  metrics.aiEnabled = aiStatus.enabled
+  metrics.aiProvider = aiStatus.provider
+  metrics.aiModel = aiStatus.model
+  metrics.aiCalls = aiStatus.calls
+  metrics.aiSuccesses = aiStatus.successes
+  metrics.aiFailures = aiStatus.failures
+  metrics.aiLastCallMs = aiStatus.lastCallMs
+  metrics.aiLastError = aiStatus.lastError
+  metrics.aiHealthState = aiStatus.healthState
+  metrics.aiBusy = aiStatus.busy
+  metrics.aiBusyLabel = aiStatus.busyLabel
+  metrics.aiBusySince = aiStatus.busySince
+  metrics.aiConfigTimeoutMs = aiStatus.configTimeoutMs
+  metrics.aiMaxObservedMs = aiStatus.maxObservedMs
+  metrics.aiLastDurationMs = aiStatus.lastDurationMs
+  metrics.aiTimeoutWarn = aiStatus.timeoutWarn
+  metrics.aiTimeoutExtended = aiStatus.timeoutExtended
+  writeJson(metricsPath(), metrics)
+  // Addition 1: persist dedup cache to disk
+  failOpen(() => saveDedupCache(), "saveDedupCache")
+}
+
+function flushMetricsHeavy(dirtyCount?: number) {
+  // Ciężkie metryki: git, stat, regression — wołane tylko na eventach sesji.
+  // dirtyCount opcjonalnie z zewnątrz (gdy session.idle już policzyło gitStatusPorcelain).
   metrics.headSha = failOpenReturn(() => getHeadSha().slice(0, 8), "", "flushMetrics headSha")
-  metrics.dirtyFiles = failOpenReturn(() => gitStatusPorcelain().length, 0, "flushMetrics dirty")
+  metrics.dirtyFiles = dirtyCount ?? failOpenReturn(() => gitStatusPorcelain().length, 0, "flushMetrics dirty")
   metrics.artifactsBytes = dirSizeBytes(artifactsDir())
   metrics.cacheBytes = dirSizeBytes(join(memoryDir, "cache"))
   metrics.diskBytes = metrics.artifactsBytes + metrics.cacheBytes
-  metrics.diskLimitBytes = MAX_ARTIFACT_DIR_MB * 1024 * 1024
-  metrics.dedupCacheMax = cfg.maxDedupCacheEntries
-  metrics.dedupCacheCount = seen.length
-  metrics.testHistoryMax = cfg.maxTestHistoryEntries
-  metrics.testHistoryCount = testHistory.length
   metrics.factsMaxTokens = cfg.maxProjectMemoryTokens
   metrics.factsTokens = failOpenReturn(() => estimateTokens(readText(factsPath()) ?? ""), 0, "flushMetrics factsTokens")
+  metrics.testHistoryCount = testHistory.length
   const sess = failOpenReturn(() => readActiveSession(), null, "flushMetrics activeSession")
   if (sess) {
     metrics.modifiedCount = sess.modifiedFiles?.length ?? 0
@@ -1539,9 +2728,17 @@ function flushMetrics() {
   }
   const reg = failOpenReturn(() => findRegressionWindow(), { lastGood: null, firstRed: null, failingTest: "" }, "flushMetrics regression")
   metrics.lastGoodHead = reg.lastGood?.head?.slice(0, 8) ?? ""
+  // Artifact list for TUI (avoids separate readdirSync+statSync every 3s)
+  metrics.artifactsList = failOpenReturn(() => {
+    const dir = artifactsDir()
+    const files = readdirSync(dir).filter((f) => f.endsWith(".log"))
+    return files.map((f) => {
+      let bytes = 0
+      try { bytes = statSync(join(dir, f)).size } catch {}
+      return { id: f.replace(/\.log$/, ""), bytes }
+    }).sort((a, b) => b.bytes - a.bytes)
+  }, [], "flushMetrics artifactsList")
   writeJson(metricsPath(), metrics)
-  // Addition 1: persist dedup cache to disk
-  failOpen(() => saveDedupCache(), "saveDedupCache")
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,7 +2764,7 @@ function memoryStatus(): string {
     `Worktree: ${worktreePath}`,
     `Project facts: ${estimateTokens(facts)} tokens (${facts.length} chars)`,
     `Active session: ${sess?.sessionId ?? "none"} (updated ${sess?.updatedAt ?? "-"})`,
-    `Dedup cache: ${seen.length} wpisów${cfg.persistentDedupCache ? " (trwały na dysku)" : " (tylko RAM)"}`,
+    `Dedup cache: ${seen.size} wpisów${cfg.persistentDedupCache ? " (trwały na dysku)" : " (tylko RAM)"}`,
     `Artifacts: ${artifacts} (${(artifactBytes / 1024).toFixed(1)} KB)`,
     `Test history: ${testHistory.length} uruchomień`,
     `Metrics: ${metrics.toolCalls} tool calls, ${metrics.estimatedReductionPercent}% reduction, ${metrics.deduplicatedReads} dedup reads`,
@@ -1648,7 +2845,7 @@ function memoryShow(): string {
 }
 
 function memoryClearSession(): string {
-  seen = []
+  seen = new Map()
   metrics = {
     ...metrics,
     sessionId: lastSessionId,
@@ -1668,6 +2865,7 @@ function memoryClearSession(): string {
     dirtyFiles: 0,
     diskBytes: 0,
     artifactsBytes: 0,
+    artifactsList: [],
     cacheBytes: 0,
     handoffAgeMin: 0,
     modifiedCount: 0,
@@ -1689,6 +2887,9 @@ function memoryClearSession(): string {
     rmSync(dedupCachePath(), { force: true })
     rmSync(testHistoryPath(), { force: true })
     rmSync(metricsPath(), { force: true })
+    rmSync(aiThrottlePath(), { force: true })
+    rmSync(aiMaxObservedPath(), { force: true })
+    aiClearTimeoutOverride()
     // Prune artifacts dir (session-scoped); recreate empty.
     rmSync(artifactsDir(), { recursive: true, force: true })
     ensureDir(artifactsDir())
@@ -1743,7 +2944,7 @@ function contextArtifacts(): string {
 function memoryPropose(): string {
   const proposed = buildProposedFacts()
   writeFileSync(proposedFactsPath(), proposed, "utf8")
-  return proposed + "\n\n---\nAby dopisać te propozycje do project-facts.md, uruchom:  /memory commit"
+  return proposed + "\n\n---\nAby dopisać te propozycje do project-facts.md, uruchom:  /codemem commit"
 }
 
 function memoryAutoRefresh(): string {
@@ -1794,8 +2995,8 @@ function compactStatusText(): string {
   if (lastContextTokens >= threshold) {
     lines.push("")
     lines.push("⚠ Próg przekroczony — sugerowana kompaktacja.")
-    if (cfg.compactMode === "suggest") lines.push("Aby skompaktować: użyj natywnej komendy OpenCode (np. /compact w TUI) lub /memory compact-now.")
-    else if (cfg.compactMode === "confirm") lines.push("Aby skompaktować: /memory compact-now. Aby odłożyć: /memory compact-reset.")
+    if (cfg.compactMode === "suggest") lines.push("Aby skompaktować: użyj natywnej komendy OpenCode (np. /compact w TUI) lub /codemem compact-now.")
+    else if (cfg.compactMode === "confirm") lines.push("Aby skompaktować: /codemem compact-now. Aby odłożyć: /codemem compact-reset.")
     else if (cfg.compactMode === "auto") lines.push("Tryb auto: OpenCode skompaktuje automatycznie (compaction.auto=true).")
     else if (cfg.compactMode === "off") lines.push("Tryb off: kompaktacja wyłączona w pluginie.")
   }
@@ -1804,12 +3005,12 @@ function compactStatusText(): string {
 
 async function autodetectModelLimit(client: any, modelKey: string): Promise<number> {
   if (!client || !modelKey) return 0
-  const [providerID, modelID] = modelKey.split("/")
+  const [providerID, modelID] = parseModelKey(modelKey)
   if (!providerID || !modelID) return 0
   try {
     const res = await client?.config?.providers?.()
-    const body = res?.body ?? res
-    const providers = body?.providers ?? []
+    const body = res?.body ?? res?.data ?? res
+    const providers = body?.providers ?? body?.data?.providers ?? []
     for (const p of providers) {
       if (p.id !== providerID) continue
       const m = p?.models?.[modelID]
@@ -1865,7 +3066,7 @@ function memoryCompactStatus(): string {
 
 function memoryCompactReset(): string {
   compactSuggestionShown = false
-  return "Flaga sugestii kompaktacji zresetowana. /memory compact-status pokaże bieżący stan."
+  return "Flaga sugestii kompaktacji zresetowana. /codemem compact-status pokaże bieżący stan."
 }
 
 async function memoryCompactNow(client: any): Promise<string> {
@@ -1888,7 +3089,88 @@ async function memoryCompactNow(client: any): Promise<string> {
   ].join("\n")
 }
 
-// --- /memory init ------------------------------------------------------------
+// --- /codemem exit ------------------------------------------------------------
+// Wrapper na /exit: przed wyjściem generuje podsumowanie AI sesji, zapisuje je
+// do active-session.json (currentStatus) i wywołuje natywną komendę exit TUI.
+// AI jest wywoływane synchronicznie (await) — throttle z session.idle NIE ma tu
+// zastosowania, bo to żądanie na żądanie użytkownika (jak /codemem ai triage).
+// Fallback gdy AI wyłączone/niedostępne: deterministic podsumowanie z handoffa.
+
+async function codememExit(client: any): Promise<string> {
+  const edits = gitStatusPorcelain()
+
+  // Odśwież auto-fakty przed zapisem kontekstu (pakiet, testy, struktura).
+  if (cfg.autoExtractFacts) failOpen(() => refreshAutoFacts(), "refreshAutoFacts on /codemem exit")
+
+  const handoff = buildHandoff(lastSessionId, edits)
+  writeActiveSession(handoff)
+
+  const lines: string[] = []
+  let aiError = false
+
+  // AI summary — omija throttle (komenda na żądanie), await przed exit.
+  // Generuj zawsze gdy AI włączone i jest JAKAKOLWIEK aktywność sesji,
+  // nie tylko git-zmiany (decyzje, blokery, testy też są istotne).
+  const aiOn = aiEffectiveConfig() !== null
+  const hasActivity = edits.length > 0
+    || !!handoff.testStatus
+    || handoff.decisions.length > 0
+    || handoff.blockers.length > 0
+    || handoff.modifiedFiles.length > 0
+  if (aiOn && hasActivity) {
+    const ok = await failOpenAsync(async () => {
+      const summary = await aiSummarizeSession(edits, handoff.testStatus ? {
+        command: handoff.testStatus.lastCommand,
+        exitCode: handoff.testStatus.exitCode,
+        summary: handoff.testStatus.summary,
+      } : undefined, {
+        decisions: handoff.decisions.slice(0, 5),
+        blockers: handoff.blockers.slice(0, 3),
+      })
+      if (summary) {
+        const s = readActiveSession()
+        if (s) {
+          s.currentStatus = summary.slice(0, 400)
+          writeActiveSession(s)
+          lines.push(`AI: ${summary}`)
+        }
+      }
+    }, "aiSummarizeSession on /codemem exit")
+    if (!ok) aiError = true
+  }
+
+  // Deterministic fallback summary gdy AI nie dało wyniku.
+  if (lines.length === 0) {
+    const bits: string[] = []
+    if (handoff.modifiedFiles.length) bits.push(`zmodyfikowano ${handoff.modifiedFiles.length} plik(ów)`)
+    if (handoff.testStatus) bits.push(`test ${handoff.testStatus.lastCommand} exit=${handoff.testStatus.exitCode}`)
+    if (handoff.blockers.length) bits.push(`${handoff.blockers.length} bloker(ów)`)
+    if (handoff.decisions.length) bits.push(`${handoff.decisions.length} decyzji`)
+    lines.push(bits.length ? `Sesja: ${bits.join(", ")}.` : "Sesja: brak istotnych zmian.")
+  }
+
+  // Wywołaj natywny exit przez TUI, tylko gdy nie było błędu AI.
+  // Komenda "exit" odpowiada /exit (alias /quit, /q).
+  if (!aiError) {
+    let exited = false
+    try {
+      if (client?.tui?.executeCommand) {
+        await client.tui.executeCommand({ body: { command: "exit" } })
+        exited = true
+      }
+    } catch { /* ignore — pozwól zwrócić instrukcję */ }
+
+    if (!exited) {
+      lines.push("", "Nie udało się programowo wywołać exit. Naciśnij ctrl+x q lub /exit ręcznie.")
+    }
+  } else {
+    lines.push("", "AI summary nie powiodło się — exit wstrzymany. Sprawdź /codemem ai status.")
+  }
+
+  return lines.join("\n")
+}
+
+// --- /codemem init ------------------------------------------------------------
 // Wykrywa dane z repo (ekstraktory auto-fakts) i wstępnie wypełnia project-facts.md
 // podpowiedziami. Idempotentny: nie nadpisuje nietrywialnego pliku; --force nadpisuje.
 
@@ -1905,7 +3187,7 @@ function buildInitFactsTemplate(force: boolean): { wrote: boolean; path: string;
   const arch = extractArchitecture(root)
   const out: string[] = []
   out.push("# project-facts.md")
-  out.push("# Fakty ręczne o projekcie. Inicjalizowane przez /memory init.")
+  out.push("# Fakty ręczne o projekcie. Inicjalizowane przez /codemem init.")
   out.push("# Auto-wykryte wartości to podpowiedzi — edytuj swobodnie. Regenerowane auto-fakty: project-facts.auto.md")
   out.push("")
 
@@ -1976,7 +3258,7 @@ function buildInitFactsTemplate(force: boolean): { wrote: boolean; path: string;
 
   // Idempotencja: nie nadpisuj, chyba że force lub domyślny szablon
   if (existing && !force && !isDefaultFactsTemplate(existing)) {
-    return { wrote: false, path, body, skipped: "istniejący project-facts.md nietrywialny — użyj /memory init --force, aby nadpisać" }
+    return { wrote: false, path, body, skipped: "istniejący project-facts.md nietrywialny — użyj /codemem init --force, aby nadpisać" }
   }
   if (existing && !force && isDefaultFactsTemplate(existing)) {
     // backup domyślnego szablonu
@@ -1987,7 +3269,7 @@ function buildInitFactsTemplate(force: boolean): { wrote: boolean; path: string;
 }
 
 function memoryInit(args: string): string {
-  const force = /\b--force\b/.test(args)
+  const force = /--force/.test(args)
   const res = buildInitFactsTemplate(force)
   const lines: string[] = []
   if (res.wrote) {
@@ -1997,10 +3279,10 @@ function memoryInit(args: string): string {
     lines.push("---")
     lines.push("Wykryte podpowiedzi wstawione do sekcji: Architektura, Komendy, Środowisko.")
     lines.push("Sekcje Konwencje i Ryzyka pozostawiono puste — uzupełnij ręcznie.")
-    lines.push("Auto-fakty (.auto.md) są regenerowane oddzielnie na session.idle lub /memory auto-refresh.")
+    lines.push("Auto-fakty (.auto.md) są regenerowane oddzielnie na session.idle lub /codemem auto-refresh.")
   } else {
     lines.push(`NIE zapisano: ${res.skipped}`)
-    lines.push("Aby zobaczyć proponowany szablon bez zapisu, edytuj ręcznie lub użyj /memory init --force.")
+    lines.push("Aby zobaczyć proponowany szablon bez zapisu, edytuj ręcznie lub użyj /codemem init --force.")
   }
   return lines.join("\n")
 }
@@ -2019,11 +3301,132 @@ function memoryTestHistory(): string {
 // Plugin
 // ---------------------------------------------------------------------------
 
+// Workaround: opencode-1.18.15 nie przekazuje options z krotki [path, opts]
+// w opencode.json do local-plugin (patrz options-dump.json -> optionsKeys: []).
+// Czytaj opencode.json ręcznie i wyciągnij blok "ai" dla tego pluginu.
+function loadAiConfigFromFile(root: string): Partial<AIConfig> | null {
+  const candidates = [
+    join(root, "opencode.json"),
+    join(root, "opencode.jsonc"),
+    join(root, ".opencode", "opencode.json"),
+  ]
+  for (const path of candidates) {
+    if (!existsSync(path)) continue
+    let raw: string
+    try { raw = readFileSync(path, "utf8") } catch { continue }
+
+    // (1) Szybka ścieżka: surowy JSON (TAB-y są poprawne). Plik bez komentarzy.
+    let parsed: any = null
+    try { parsed = JSON.parse(raw) } catch {}
+
+    // (2) Fallback: usuń komentarze, ale string-aware (nie tnij // wewnątrz "...").
+    if (!parsed) {
+      const stripped = stripJsonComments(raw)
+      try { parsed = JSON.parse(stripped) } catch { continue }
+    }
+
+    const plugins = parsed?.plugin
+    if (!Array.isArray(plugins)) continue
+    for (const entry of plugins) {
+      let opts: any = null
+      let pluginPath: string = ""
+      if (typeof entry === "string") { pluginPath = entry; opts = null }
+      else if (Array.isArray(entry) && entry.length >= 2) { pluginPath = String(entry[0]); opts = entry[1] }
+      else if (entry && typeof entry === "object") { pluginPath = String(entry.path ?? entry.id ?? ""); opts = entry.options ?? entry }
+      if (!pluginPath.includes("project-context")) continue
+      if (opts && typeof opts === "object" && opts.ai && typeof opts.ai === "object") {
+        return opts.ai as Partial<AIConfig>
+      }
+    }
+  }
+  return null
+}
+
+// String-aware comment stripper. Omijamy // i /* */ wewnątrz "...".
+// Naiwny regex /\/\/[^\n]*/g tnie URL-e (http://) i psuje parsowanie.
+function stripJsonComments(src: string): string {
+  let out = ""
+  let i = 0
+  let inString = false
+  let escape = false
+  const n = src.length
+  while (i < n) {
+    const ch = src[i]
+    const next = src[i + 1]
+    if (inString) {
+      out += ch
+      if (escape) { escape = false }
+      else if (ch === "\\") { escape = true }
+      else if (ch === '"') { inString = false }
+      i++
+      continue
+    }
+    // Poza stringiem: wykryj komentarz
+    if (ch === '"') { inString = true; out += ch; i++; continue }
+    if (ch === '/' && next === '/') {
+      while (i < n && src[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
 export const ProjectContextPlugin: Plugin = async ({ project, client, $, directory, worktree }, options) => {
   initMemoryLayout(worktree || directory || process.cwd())
+  pluginClient = client
 
   const userConfig = (options ?? {}) as Partial<Config>
   cfg = { ...DEFAULT_CONFIG, ...userConfig }
+
+  // Workaround: jeśli options.ai nie przyszedł (puste options), doładuj z opencode.json
+  if (!userConfig.ai || !userConfig.ai.enabled) {
+    const root = worktree || directory || process.cwd()
+    const fileAi = loadAiConfigFromFile(root)
+    if (fileAi) {
+      cfg.ai = { ...DEFAULT_CONFIG.ai, ...fileAi }
+    }
+  }
+
+  // Zastosuj timeout override z /codemem ai auto-timeout (jeśli zapisany w cache).
+  // Override = maxObservedMs * 1.3; przeżywa restarty bo zapisany w pliku.
+  const overrideMs = aiLoadTimeoutOverride()
+  if (overrideMs > 0) cfg.ai.timeoutMs = overrideMs
+
+  try { writeFileSync(join(memoryDir, "cache", "options-dump.json"), JSON.stringify({ optionsRaw: options, optionsKeys: Object.keys(options ?? {}), cfgAi: cfg.ai, aiEffective: aiEffectiveConfig() }, null, 2)) } catch {}
+
+  // Reset AI counters at plugin init (before session.created) — TUI czyta
+  // metrics.json przy starcie; bez tego pokazuje stare dane z poprzedniej sesji
+  // (np. "active 30021ms 2/4 ok"). Ustawiamy unknown + 0 calls, a session.created
+  // health-check nadpisze na active/offline.
+  const initAiCfg = aiEffectiveConfig()
+  if (initAiCfg) {
+    metrics.aiEnabled = true
+    metrics.aiProvider = initAiCfg.provider
+    metrics.aiModel = initAiCfg.model
+    metrics.aiCalls = 0
+    metrics.aiSuccesses = 0
+    metrics.aiFailures = 0
+    metrics.aiLastCallMs = 0
+    metrics.aiLastError = ""
+    metrics.aiHealthState = "unknown"
+    metrics.aiBusy = false
+    metrics.aiBusyLabel = ""
+    metrics.aiBusySince = 0
+    metrics.aiConfigTimeoutMs = initAiCfg.timeoutMs
+    metrics.aiMaxObservedMs = aiStatus.maxObservedMs
+    metrics.aiLastDurationMs = 0
+    metrics.aiTimeoutWarn = false
+    metrics.aiTimeoutExtended = false
+    failOpen(() => writeJson(metricsPath(), metrics), "flushMetrics at plugin init")
+  }
 
   return {
     // ------------------------------------------------------ session lifecycle
@@ -2052,25 +3455,81 @@ export const ProjectContextPlugin: Plugin = async ({ project, client, $, directo
           const git = await gitInfo($)
           const block = buildInjectedContext(facts, sess, git)
           lastInjectedContext = block
-          // Try to append to the TUI prompt (SDK: tui.appendPrompt)
-          try {
-            await client?.tui?.appendPrompt?.({ body: { text: block } })
-          } catch {
-            // append not available; context stored for /memory show
+          // Wstrzykiwanie przez experimental.chat.system.transform (niewidoczne
+          // w oknie czatu — kontekst trafia do system prompta modela).
+          pendingSystemContext = block
+          // Reset synchroniczny aiStatus PRZED health check — TUI nie pokaże
+          // starych liczników/czasów z poprzedniej sesji (np. "30003ms 1/2 ok"),
+          // tylko "checking…" na czysto.
+          const aiCfg = aiEffectiveConfig()
+          if (aiCfg) {
+            aiStatus.enabled = true
+            aiStatus.provider = aiCfg.provider
+            aiStatus.model = aiCfg.model
+            aiStatus.calls = 0
+            aiStatus.successes = 0
+            aiStatus.failures = 0
+            aiStatus.lastCallMs = 0
+            aiStatus.lastError = ""
+            aiStatus.healthState = "unknown"
+            aiStatus.busy = false
+            aiStatus.busyLabel = ""
+            aiStatus.busySince = 0
+            flushMetrics()
           }
+          // Health check AI: wyslij krotki ping, by zweryfikowac dostepnosc modelu
+          // i nadpisaj aiStatus. Fire-and-forget — nie blokuje pipeline.
+          failOpenAsync(async () => {
+            await aiHealthCheck()
+            flushMetrics()
+          }, "aiHealthCheck on session.created")
+          failOpen(() => flushMetricsHeavy(), "flushMetricsHeavy on session.created")
         } else if (type === "session.idle" || type === "session.compacted") {
           const sessionId = event?.properties?.info?.sessionID ?? lastSessionId ?? ""
-          const edits = (await $`git -C ${worktreePath} status --porcelain`.text().catch(() => ""))
-            .split("\n").filter(Boolean).map((l: string) => l.slice(3).trim())
+          // Use execSync-based helper: the Bun shell `$` may be unavailable
+          // in some plugin runtimes ("$ is not a function" crash on session.idle)
+          const edits = gitStatusPorcelain()
           const handoff = buildHandoff(sessionId, edits)
           writeActiveSession(handoff)
+          // AI enhancement: krótki podsumowany status sesji (async, fallback = puste)
+          // #1: skip gdy brak aktywności (brak edycji + brak testStatus) — nie ma co podsumowywać.
+          // #3: throttle — min. odstęp między auto-wywołaniami AI (domyślnie 10 min).
+          const hasActivity = edits.length > 0 || !!handoff.testStatus
+          const aiThrottled = hasActivity && aiAutoThrottled()
+          if (hasActivity && !aiThrottled) {
+            failOpenAsync(async () => {
+              const summary = await aiSummarizeSession(edits, handoff.testStatus ? {
+                command: handoff.testStatus.lastCommand,
+                exitCode: handoff.testStatus.exitCode,
+                summary: handoff.testStatus.summary,
+              } : undefined)
+              if (summary) {
+                const s = readActiveSession()
+                if (s) {
+                  s.currentStatus = summary.slice(0, 400)
+                  writeActiveSession(s)
+                }
+              }
+            }, "aiSummarizeSession")
+            aiAutoMarkRun()
+          }
           // Addition 2: fold per-session trace into persistent aggregated trace
           failOpen(() => mergeTraceIntoGlobal(), "mergeTraceIntoGlobal")
           // Auto-extract deterministic facts (build/test/architecture/environment)
           if (cfg.autoExtractFacts && cfg.autoExtractOnEvents.includes(type)) {
             failOpen(() => refreshAutoFacts(), `refreshAutoFacts on ${type}`)
+            // AI enhancement: konwencje/ryzyka z README/CLAUDE.md — działa w tle,
+            // wyzwalane tylko gdy pliki źródłowe uległy zmianie (hash w cache), bez throttlingu czasowego.
+            failOpenAsync(async () => {
+              const humanFacts = await aiExtractHumanFacts(worktreePath || projectRoot)
+              if (humanFacts) {
+                const p = join(memoryDir, "project-facts.ai.md")
+                writeFileSync(p, `# AI-ekstrahowane fakty (regenerowane przy session.idle)\n# Nie edytuj ręcznie; usuń plik by wyłączyć.\n\n${humanFacts}\n`, "utf8")
+              }
+            }, "aiExtractHumanFacts")
           }
           flushMetrics()
+          failOpen(() => flushMetricsHeavy(edits.length), "flushMetricsHeavy")
         } else if (type === "session.deleted") {
           // optional: remove non-persistent session data
           failOpen(() => {
@@ -2092,7 +3551,9 @@ export const ProjectContextPlugin: Plugin = async ({ project, client, $, directo
           const fp: string = event?.properties?.path ?? event?.properties?.info?.path ?? ""
           if (fp) {
             // invalidate read cache for that file (Addition 1: persistent cache)
-            seen = seen.filter((s) => s.filePath !== fp)
+            for (const [k, s] of seen) {
+              if (s.filePath === fp) seen.delete(k)
+            }
             failOpen(() => saveDedupCache(), "saveDedupCache on file.edited")
             // Addition 2: track edit count in session trace
             const rel = failOpenReturn(() => relative(worktreePath, fp) || fp, fp, "relative path")
@@ -2106,13 +3567,13 @@ export const ProjectContextPlugin: Plugin = async ({ project, client, $, directo
           }
         } else if (type === "command.executed") {
           const cmd: string = event?.properties?.command ?? ""
-          if (cmd.startsWith("/memory ") || cmd.startsWith("/context ")) {
+          if (cmd.startsWith("/codemem ") || cmd.startsWith("/context ")) {
             // handled below via tui.command.execute; nothing here
           }
-          // CLI fallback: /memory tui działa też w trybie non-interactive
-          if (cmd.startsWith("/memory tui")) {
+          // CLI fallback: /codemem tui działa też w trybie non-interactive
+          if (cmd.startsWith("/codemem tui")) {
             const out: { result?: string } = {}
-            await failOpenAsync(async () => { out.result = memoryTuiDump() }, "command.executed /memory tui")
+            await failOpenAsync(async () => { out.result = memoryTuiDump() }, "command.executed /codemem tui")
             if (out.result) console.log(out.result)
           }
         } else if (type === "message.updated") {
@@ -2156,6 +3617,16 @@ export const ProjectContextPlugin: Plugin = async ({ project, client, $, directo
       }, "experimental.compaction.autocontinue")
     },
 
+    // Wstrzykiwanie kontekstu projektu do system prompta (niewidoczne w oknie
+    // czatu). Dokłada blok PROJECT MEMORY (fakty + handoff + git) do output.system.
+    "experimental.chat.system.transform": async (input: any, output: any) => {
+      await failOpenAsync(async () => {
+        if (!pendingSystemContext) return
+        if (!Array.isArray(output.system)) output.system = []
+        ;(output.system as string[]).push(pendingSystemContext)
+      }, "experimental.chat.system.transform")
+    },
+
     // ----------------------------------------------------- tool.execute hooks
     "tool.execute.before": async (input: any, output: any) => {
       await failOpenAsync(async () => {
@@ -2164,7 +3635,7 @@ export const ProjectContextPlugin: Plugin = async ({ project, client, $, directo
         if (t === "read") {
           const fp: string = output?.args?.filePath ?? ""
           if (isSensitivePath(fp)) {
-            throw new Error(`Blocked read of sensitive file: ${fp}. Use /memory to allow explicitly.`)
+            throw new Error(`Blocked read of sensitive file: ${fp}. Use /codemem to allow explicitly.`)
           }
         }
         // security: block bash reading secrets
@@ -2210,43 +3681,101 @@ export const ProjectContextPlugin: Plugin = async ({ project, client, $, directo
       }),
     },
 
+    // ------------------------------------------------------ command interception
+    // UWAGA (root cause 2026-08-04): komendy z .opencode/command/*.md ZAWSZE
+    // trafiają do modelu jako prompt (command.execute.before -> prompt() -> LLM);
+    // opencode nie wspiera jeszcze pominięcia LLM (feature request #28292 noReply).
+    // Dlatego, gdy plugin jest aktywny, wynik deterministyczny liczymy tu i
+    // zapisujemy do .opencode/memory/command_result.txt; szablon komendy każe
+    // modelowi zwrócić ten plik 1:1 (gwarantowany determinizm), a gdy pluginu
+    // brak — model działa wg jawnego opisu w szablonie.
+    "command.execute.before": async (input: any, output: any) => {
+      await failOpenAsync(async () => {
+        // opencode splits the typed slash command into `command` (e.g. "/memory"
+        // or "memory") and `arguments` (e.g. "ai models"). Reconstruct the full
+        // token stream so dispatchCommand's startsWith checks can match subcommands.
+        const cmdPart = String(input?.command ?? input?.input?.command ?? "")
+        const argPart = input?.arguments != null ? " " + String(input.arguments) : ""
+        const raw = `${cmdPart}${argPart}`.trim()
+        const norm = raw.trim()
+        if (!/^\/?((codemem|context|regression)\b)/.test(norm)) return
+        lastUserCommandTs = Date.now()
+        const slash = norm.startsWith("/") ? norm : "/" + norm
+        const result = await dispatchCommand(slash)
+        if (result === undefined) return
+        try {
+          writeFileSync(commandResultPath(), `# ${slash}\n${result}`, "utf8")
+        } catch { /* ignore */ }
+      }, "command.execute.before")
+    },
+
     // ----------------------------------------------------------- TUI commands
     "tui.command.execute": async (input: any, output: any) => {
       await failOpenAsync(async () => {
-        const cmd: string = input?.command ?? ""
-        if (cmd.startsWith("/memory status")) output.result = memoryStatus()
-        else if (cmd.startsWith("/memory show")) output.result = memoryShow()
-        else if (cmd.startsWith("/memory save")) {
-          const handoff = buildHandoff(lastSessionId, [])
-          writeActiveSession(handoff)
-          output.result = "Handoff saved."
-        }
-        else if (cmd.startsWith("/memory clear-session")) output.result = memoryClearSession()
-        else if (cmd.startsWith("/memory clear-project")) output.result = memoryClearProject()
-        else if (cmd.startsWith("/memory compact")) {
-          const handoff = buildHandoff(lastSessionId, [])
-          writeActiveSession(handoff)
-          output.result = "Compact handoff created."
-        }
-        else if (cmd.startsWith("/memory propose")) output.result = memoryPropose()
-        else if (cmd.startsWith("/memory commit")) output.result = commitProposedFacts()
-        else if (cmd.startsWith("/memory auto-refresh")) output.result = memoryAutoRefresh()
-        else if (cmd.startsWith("/memory auto")) output.result = memoryAutoShow()
-        else if (cmd.startsWith("/memory init")) output.result = memoryInit(cmd.replace(/^\/memory init\s*/, ""))
-        else if (cmd.startsWith("/memory compact-status")) output.result = memoryCompactStatus()
-        else if (cmd.startsWith("/memory compact-reset")) output.result = memoryCompactReset()
-        else if (cmd.startsWith("/memory compact-now")) output.result = await memoryCompactNow(client)
-        else if (cmd.startsWith("/memory test-history")) output.result = memoryTestHistory()
-        else if (cmd.startsWith("/memory tui")) output.result = memoryTuiDump()
-        else if (cmd.startsWith("/memory dashboard")) output.result = "Dashboard TUI: użyj w trybie interaktywnym (route: memory-dashboard)"
-        else if (cmd.startsWith("/context budget")) output.result = contextBudget()
-        else if (cmd.startsWith("/context artifacts")) output.result = contextArtifacts()
-        else if (cmd.startsWith("/regression last-good")) output.result = regressionLastGood()
-        else if (cmd.startsWith("/regression suspect")) output.result = regressionSuspect()
-        else if (cmd.startsWith("/regression revert")) output.result = regressionRevert(cmd.replace(/^\/regression revert\s*/, ""))
+        const cmdPart: string = input?.command ?? ""
+        const argPart = input?.arguments != null ? " " + String(input.arguments) : ""
+        const cmd: string = `${cmdPart}${argPart}`.trim()
+        lastUserCommandTs = Date.now()
+        const r = await dispatchCommand(cmd)
+        if (r !== undefined) output.result = r
       }, "tui.command.execute")
     },
   }
 }
+
+function commandResultPath(): string {
+  return join(memoryDir, "command_result.txt")
+}
+
+// Współdzielony dispatch komend memory/context/regression → deterministyczny wynik.
+// async: compact-now i ai triage wymagają await (wołają client API / aiComplete).
+async function dispatchCommand(cmd: string): Promise<string | undefined> {
+  if (cmd.startsWith("/codemem status")) return memoryStatus()
+  if (cmd.startsWith("/codemem show")) return memoryShow()
+  if (cmd.startsWith("/codemem save")) {
+    const handoff = buildHandoff(lastSessionId, [])
+    writeActiveSession(handoff)
+    return "Handoff saved."
+  }
+  if (cmd.startsWith("/codemem clear-session")) return memoryClearSession()
+  if (cmd.startsWith("/codemem clear-project")) return memoryClearProject()
+  if (cmd.startsWith("/codemem compact-status")) return memoryCompactStatus()
+  if (cmd.startsWith("/codemem compact-reset")) return memoryCompactReset()
+  if (cmd.startsWith("/codemem compact-now")) return memoryCompactNow(pluginClient)
+  if (cmd.startsWith("/codemem compact")) {
+    const handoff = buildHandoff(lastSessionId, [])
+    writeActiveSession(handoff)
+    return "Compact handoff created."
+  }
+  if (cmd.startsWith("/codemem propose")) return memoryPropose()
+  if (cmd.startsWith("/codemem commit")) return commitProposedFacts()
+  if (cmd.startsWith("/codemem lesson")) return memoryLesson(cmd.replace(/^\/codemem lesson\s*/, ""))
+  if (cmd.startsWith("/codemem auto-refresh")) return memoryAutoRefresh()
+  if (cmd.startsWith("/codemem auto")) return memoryAutoShow()
+  if (cmd.startsWith("/codemem init")) return memoryInit(cmd.replace(/^\/codemem init\s*/, ""))
+  if (cmd.startsWith("/codemem test-history")) return memoryTestHistory()
+  if (cmd.startsWith("/codemem ai status")) return aiStatusText()
+  if (cmd.startsWith("/codemem ai auto-timeout")) return aiAutoTimeoutCommand()
+  if (cmd.startsWith("/codemem ai triage")) return aiTriageFailedTests()
+  if (cmd.startsWith("/codemem ai")) return aiStatusText()
+  if (cmd.startsWith("/codemem tui")) return memoryTuiDump()
+  if (cmd.startsWith("/codemem exit")) return codememExit(pluginClient)
+  if (cmd.startsWith("/codemem dashboard")) return "Dashboard TUI: użyj w trybie interaktywnym (route: memory-dashboard)"
+  if (cmd.startsWith("/context budget")) return contextBudget()
+  if (cmd.startsWith("/context artifacts")) return contextArtifacts()
+  if (cmd.startsWith("/regression last-good")) return regressionLastGood()
+  if (cmd.startsWith("/regression suspect")) return regressionSuspect()
+  if (cmd.startsWith("/regression revert")) return regressionRevert(cmd.replace(/^\/regression revert\s*/, ""))
+  if (cmd.startsWith("/regression feature")) return regressionFeature(cmd.replace(/^\/regression feature\s*/, ""))
+  return undefined
+}
+
+// Eksport testowy — funkcje czysto/jednostkowe do pokrycia regresyjnego.
+export const __testState = () => ({
+  interpolateEnv,
+  aiUrl,
+  safeErrorString,
+  parseModelKey,
+})
 
 export default ProjectContextPlugin
